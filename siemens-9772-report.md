@@ -1,6 +1,7 @@
 # Siemens 9772 Terminal — Firmware Analysis Report
 
-Subject: Reverse-engineering of `siemens-9772.hex` (2 KiB TMS2516 EPROM dump).
+Subject: Reverse-engineering of `siemens-9772.hex` (2 KiB TMS2516 EPROM dump,
+re-read after the original dump was found to contain hundreds of bit errors).
 Goal: gather enough information about the terminal's hardware and firmware to
 write a replacement program that can receive async serial data and display it.
 
@@ -9,19 +10,39 @@ write a replacement program that can receive async serial data and display it.
 ## 1. Executive summary
 
 The ROM contains firmware for an **Intel 8035** (MCS-48, ROMless) running out
-of a 2 KiB external program EPROM. The terminal is a display-only device
-driven by an **SCN2661** USART and a TTL-based CRT/display controller. The
-host protocol is a command-oriented, character-framed protocol with STX/ETX
-and a BCD cursor-positioning scheme; there is clear evidence of a
-multi-drop addressing model (the firmware reads its own address from
-DIP-switches on the CPU BUS pins and gates reception on the 9th-bit /
-address-marker).
+of a 2 KiB external EPROM. The 2 KiB EPROM is in fact a **1 KiB program
+mirrored twice** (only five bytes differ between the low and high halves and
+all five are isolated single-bit flips, almost certainly residual read flake
+rather than meaningful content).
 
-The firmware never programs the SCN2661 mode registers (MR1/MR2), so the
-UART character format and baud rate are set entirely by hardware straps and
-an external clock. Practical work on a replacement firmware therefore
-requires measuring the physical serial clock and settling on an async mode
-explicitly in software.
+The terminal is driven by an **SCN2661** USART and a TTL-based CRT
+controller. The firmware:
+
+- runs a power-on ROM checksum, internal-RAM walking-bit test, external-RAM
+  test (across 16 P2-selected memory banks), and a SCN2661 internal
+  loopback test;
+- programs the SCN2661 to **9600 baud, async 16× oversampling, 8 data
+  bits, odd parity, 1 stop bit** (1 start + 8 data + 1 parity + 1 stop =
+  11 bit times per character) using the chip's internal baud-rate
+  generator. With the 5.0688 MHz system crystal the math is exact: the
+  BRG produces 153.6 kHz (= 5.0688 MHz / 33), and 153.6 kHz / 16 = 9600
+  baud;
+- reads two DIP-switch bits on P1.4 and P1.5 to choose one of three
+  display-size / multi-node modes;
+- runs a small protocol state machine that recognises STX, ETX, DC1, DC3
+  and DC4 as command introducers;
+- can both **receive** characters into display memory and **transmit**
+  them back to the host (DC4 is a "report" / response command), using T0
+  as a TxRDY handshake to the SCN2661.
+
+There is therefore a serial-line protocol with a clear multi-drop flavour:
+the master sends a DC4 + slave-id, the addressed slave answers via the
+local UART path. Display data uses STX as start-of-frame and ETX as
+end-of-frame.
+
+Replacing the firmware is straightforward: keep the SCN2661 init constants
+the original code uses (or change them), and write to the same external
+addresses for display memory.
 
 ---
 
@@ -29,385 +50,379 @@ explicitly in software.
 
 | Item | Value / evidence |
 |------|-----------------|
-| CPU | Intel 8035 (MCS-48, ROMless). Confirmed by user. The reset vector `04 1C = JMP 01Ch` and the interrupt-vector layout (0x0003 external, 0x0007 timer/counter) are classic MCS-48. |
-| Program ROM | 2 KiB at 0x000-0x7FF (this EPROM). A11 is not used by the firmware. |
-| RAM | Internal 64 bytes of the 8035 (two register banks used: `SEL RB1` on interrupt). External data RAM for the display and the USART; accessed via `MOVX`. |
-| USART | SCN2661 at external addresses 0x80/0x84/0x88/0x8C (see map below). |
-| Port expander | An 8243-class expander on P2's low nibble — `MOVD P5,A`, `ANLD P5,A`, `MOVD P7,A`, `ORLD P7,A` appear repeatedly. Gives ports P4..P7. |
-| Display | TTL-based controller (per user). Character cell memory is externally mapped. Display is 40 cells (positions 0..39), with the firmware using BCD row/column encoding (`00h..39h`, i.e. `high nibble*10 + low nibble`). |
-| Physical ports | Three DE-9 connectors: one DTE male (upstream host), two female (downstream devices, likely soft-UART). |
+| CPU | Intel 8035 (MCS-48, ROMless). Reset vector at 0x0000 is `04 1C` = `JMP 001Ch`; external-INT vector at 0x0003 is `JMP 033Ah`; timer/counter ISR is inline at 0x0007 ending in `RETR`. |
+| System clock | 5.0688 MHz crystal (per user — feeds the 8035 and probably also the SCN2661 BRG). |
+| Program ROM | 2 KiB EPROM, but only 1 KiB of unique content (mirrored). A11 is unused. |
+| RAM (internal) | 64 bytes of 8035 internal RAM, two register banks. ISR uses `SEL RB1`. |
+| RAM (external) | Display memory + ring buffer for received characters; addressed via `MOVX` with the upper nibble of P2 used as a bank-select. |
+| USART | SCN2661 at external addresses 0x80/0x84/0x88/0x8C. |
+| Port expander | 8243-class on P2 low nibble: `MOVD P5,A`, `ANLD P5,A`, `MOVD P7,A`, `ORLD P7,A` are used in a few code paths (probably display attribute / row drivers). |
+| Three physical ports | One DTE male DE9 upstream (the SCN2661), two female DE9 downstream (almost certainly bit-banged via P1 and the 8243; not yet fully traced). |
 
 ---
 
-## 3. Memory map
+## 3. SCN2661 configuration (the headline result)
 
-### Program memory (internal view of the 8035)
-
-| Range | Contents |
-|-------|----------|
-| 0x0000 | Reset vector: `JMP 0x001C`. |
-| 0x0003 | External interrupt vector: `NOP; JMP 0x033A`. SCN2661 RxRDY handler. |
-| 0x0007-0x001B | Timer/counter interrupt handler (inline). |
-| 0x001C-0x002A | Start-of-reset: checksum page 0, jump to 0x0100. |
-| 0x0100-0x0109 | Checksum of page 1, then `JMP 0x02DB`. |
-| 0x010A-0x01B9 | Per-character state dispatcher (see §7) — first copy. |
-| 0x0200-0x02D5 | Character high-nibble dispatcher and action table. |
-| 0x02DB-0x02E4 | Setup continuation; `JMP 0x0329` to checksum page 3. |
-| 0x0300-0x0339 | **Page-3 BCD position table**: index = (rx_char − 0x30), value = BCD position 00..39. |
-| 0x033A-0x03B1 | SCN2661 RxRDY interrupt handler proper. |
-| 0x0400-0x04FF | Mirror of 0x0000-0x00FF with small variations (the reset vector still points at 0x001C in the first half; the page exists because `JMPP @A` dispatch must be in the current page). |
-| 0x0500-0x05FF | Second copy of the state dispatcher (mirror of 0x0100-0x01FF, a few extra cases). |
-| 0x0600-0x06FF | Second copy of the high-nibble dispatcher (mirror of 0x0200). |
-| 0x0700-0x0739 | Second copy of the BCD position table. |
-| 0x0723-0x0770 | Post-self-test main loop entry. |
-
-### External data memory (seen from `MOVX`)
-
-| Address | Device / purpose |
-|---------|-------------------|
-| 0x00-0x7F | External RAM (display buffer; cell = 7 bits character + bit-7 = visible/cursor flag). |
-| 0x80 | SCN2661 RHR / THR (data). |
-| 0x84 | SCN2661 status register. |
-| 0x88 | SCN2661 mode register (MR1, MR2) — **never written by this firmware**. |
-| 0x8C | SCN2661 command register — written with `0x15`. |
-
-Address decoding: bit 7 of the external address selects the SCN2661; CPU A2→RS0, CPU A3→RS1. Cells in display memory are selected by bits 0..6 (40-position organization plus possibly line flags).
-
-The P2 upper nibble is driven via `OUTL P2,A` (with nibble-swapped data) before some `MOVX` accesses; this presumably selects between display-memory banks or between the display and the SCN2661 group.
-
-### Internal RAM locations in use
-
-| Addr | Purpose (inferred) |
-|------|--------------------|
-| 0x14 | Timer/counter reload value (loaded into T in the ISR). |
-| 0x15 | P1 XOR mask applied every timer tick (cursor blink / LED toggle). |
-| 0x16 | Terminal address limit/offset used in the 0x80-0x8F handler. |
-| 0x17 | Current receive-protocol state (indexed via `JMPP @A`). |
-| 0x3D..0x3F | Working area / RAM-test scratch (probably stack). |
-
----
-
-## 4. I/O-pin usage summary
-
-| Pin / port | Role |
-|------------|------|
-| BUS (P0) | Multiplexed address/data for external ROM+RAM; used as a byte port via `INS A,BUS` at 0x0160 to read the **DIP-switch address** when a high-bit frame arrives. |
-| P1 | Bi-directional. Read (`IN A,P1`) many times; written (`OUTL P1,A`) and XOR-toggled by the timer ISR. Likely the bit-banged lines for the two downstream DE9 ports and/or a piezo/LED. |
-| P2 low | External ROM A8..A11 (default MCS-48 behaviour). |
-| P2 high | Written as chip-select / display-bank select before certain `MOVX` writes. |
-| P4..P7 | Via 8243 expander on P2 low nibble (`MOVD`, `ANLD`, `ORLD`). Drives the TTL display controller and possibly the downstream soft-UART lines. |
-| T0 | Tested at 0x0724 (`JT0 0737h`). Routes between the normal main loop and an on-board diagnostic checksum loop. |
-| T1 | Counter clock input (`STRT CNT`). Feeds the periodic timer interrupt. Probably the baud-rate clock or a dedicated 50/60 Hz tick. |
-| INT | SCN2661 interrupt request (RxRDY). |
-
----
-
-## 5. Reset, self-test and main loop
-
-1. **Reset** at 0x0000 → `JMP 0x001C`.
-2. **Checksum loop** (0x001C) walks pages 0, 1 and 3 via `MOVP A,@A`, accumulating a rolling rotate/XOR checksum into R1. If the final compare at 0x002B fails, jumps to 0x009D (hang / error indicator).
-3. **Internal-RAM test** at 0x0031: writes 0x3D..0x01 patterns, verifies, rotates pattern through all bit positions. On failure, same hang target.
-4. **External RAM test** starting at 0x00E3 (`OUTL P2,#0`, then `MOVX @R0,A; XRL` through every external address). Note: this touches the SCN2661 register window; the subsequent explicit write to CR(0x8C) re-arms the USART.
-5. **Main loop** at 0x0723:
-   - `DIS TCNTI` (disables counter interrupt during setup).
-   - `JT0 0x0737` — if T0 is high, proceed to the normal receive/display loop; otherwise fall through to an extra checksum loop (factory-test / power-on diagnostic).
-   - 0x0737: `CALL 0x07FF`, then `SEL RB1`, read RHR from 0x80, read SR from 0x84, mask error bits (`ANL A,#38h` = FE|OE|PE), and on error write `0x15` to CR(0x8C) to reset the flags. Continues into the state dispatcher.
-
-The firmware is interrupt-driven: each received byte triggers `INT`, the handler at 0x033A pulls the byte, stages it in R4, invokes the state machine, writes the glyph into display RAM and returns (`RETR`).
-
----
-
-## 6. Interrupt handlers
-
-### Timer/counter ISR (0x0007)
+The fresh dump contains a clean three-step init sequence that the previous
+corrupted dump had completely garbled:
 
 ```
-MOV  R7,A           ; save A
-MOV  A,R0           ; save R0
+0082: B8 88     MOV  R0,#88h       ; mode-register address
+0084: 23 5E     MOV  A,#5Eh
+0086: 90        MOVX @R0,A         ; MR1 = 0x5E
+0087: 23 3E     MOV  A,#3Eh        ; (chip auto-toggles to MR2 on second access)
+0089: 90        MOVX @R0,A         ; MR2 = 0x3E
+008A: B8 8C     MOV  R0,#8Ch       ; command-register address
+008C: 23 B7     MOV  A,#B7h
+008E: 90        MOVX @R0,A         ; CR = 0xB7  (LOCAL LOOPBACK + TxEN+RxEN+DTR+RTS)
+008F: B8 80     MOV  R0,#80h
+0091: 23 55     MOV  A,#55h
+0093: 90        MOVX @R0,A         ; transmit 0x55 (test pattern)
+0094: 86 98     JNI  0098h         ; wait for /INT (RxRDY in loopback)
+0096: 04 94     JMP  0094h
+0098: 80        MOVX A,@R0         ; read RHR
+0099: D3 55     XRL  A,#55h        ; equal?
+009B: C6 9F     JZ   009Fh         ; yes -> continue
+009D: 04 9D     JMP  009Dh         ; no -> hang here
+009F: B8 8C     MOV  R0,#8Ch
+00A1: 23 15     MOV  A,#15h
+00A3: 90        MOVX @R0,A         ; CR = 0x15  (normal ops, TxEN+RxEN, clear errors)
+```
+
+Decoding the constants against a Signetics SCN2661 datasheet:
+
+### MR1 = 0x5E = `0101_1110`
+
+The SCN2661 datasheet defines the MR1 fields as (high to low):
+
+| Bits | Field | Value | Meaning |
+|------|-------|-------|---------|
+| D7 D6 | Stop bits | `01` | **1 stop bit** |
+| D5 | Parity type | `0` | **odd** |
+| D4 | Parity enable | `1` | **enabled** |
+| D3 D2 | Character length | `11` | **8 data bits** |
+| D1 D0 | Mode / baud factor | `10` | **async, 16× oversampling** |
+
+Total frame: 1 start + 8 data + 1 parity + 1 stop = **11 bit times per
+character** = standard **8O1**.
+
+Important consequence: the 8 data bits carry the full byte that the
+firmware reads, including the high bit. The chargen ROM has glyphs for
+codes 0x00-0xFF (German umlauts at 0x80-0x87 and 0xA0-0xA7), so the wire
+really does deliver 8-bit code points, and bit 7 is **software-level
+addressing / control**, not a parity bit (the SCN2661 strips the parity
+bit before the data hits the CPU).
+
+### MR2 = 0x3E = `0011_1110`
+
+| Bits | Field | Value | Meaning |
+|------|-------|-------|---------|
+| D3:D0 | BRG baud-rate code | `1110` (=14) | **9600 baud** in the standard SCN2661 BRG table |
+| D4 | Tx clock select | `1` | from internal BRG |
+| D5 | Rx clock select | `1` | from internal BRG |
+| D7:D6 | reserved | `00` | — |
+
+So the chip runs its **internal BRG at 9600 baud** and uses that clock
+both for transmit and for receive. With 16× oversampling the BRG drives
+RxC/TxC at 9600 × 16 = **153.6 kHz**. With the 5.0688 MHz system crystal
+this lands exactly on the integer divider: 5.0688 MHz / 33 = 153.6 kHz
+to the part-per-million. The Signetics SCN2661B variant ships with a
+BRG table calibrated to 5.0688 MHz, so this is the chip variant the
+board is using (or the board has a separate 4.9152 MHz crystal on the
+SCN2661, which would also give exactly 9600 baud via the standard
+SCN2661A table).
+
+Easiest verification: scope the **TxC** or **RxC** pin of the SCN2661.
+You should see exactly 153.6 kHz — anything else means the BRG input
+clock isn't what the standard table assumes.
+
+### CR after self-test: 0x15 = `0001_0101`
+
+| Bits | Field | Value | Meaning |
+|------|-------|-------|---------|
+| D0 | TxEN | `1` | transmitter enabled |
+| D1 | DTR | `0` | DTR off |
+| D2 | RxEN | `1` | receiver enabled |
+| D3 | Force break | `0` | — |
+| D4 | Reset error | `1` | clear error flags |
+| D5 | RTS | `0` | RTS off |
+| D7:D6 | Operating mode | `00` | normal operation |
+
+DTR and RTS are deliberately deasserted; the design uses **T0 as TxRDY
+handshake** instead of the modem-control lines.
+
+---
+
+## 4. Reset / self-test sequence
+
+1. **Reset** at 0x0000 → `JMP 0x001C`.
+2. **ROM checksum** loops over pages 0, 1, 3 with a rotate-XOR accumulator
+   in R1. After page 3 the accumulator is XOR'd with the byte at offset
+   0x0002 (which is 0x28 in the low half, 0xAC in the high half). On
+   mismatch the code jumps to `0x009D` (a `JMP $` deliberate hang).
+3. **Internal-RAM walking-bit test** at 0x0031: writes RAM[0x01..0x3F]
+   with the address itself, then with each rotate-shift of pattern 0x01;
+   any mismatch hangs at 0x009D.
+4. **External-RAM test** at 0x0061: walks all 16 P2-upper-nibble banks
+   (`IN P2`, `ADD #0x10`, `OUTL P2`) and within each bank tests the 64
+   addresses `R0 = 0..0x3F` (the loop bails when R0 bit 6 goes high so
+   the SCN2661 window at 0x80+ is **not** clobbered).
+5. **SCN2661 LOCAL LOOPBACK self-test** as shown in §3.
+6. Final `OUTL P1, #0xF7` (initial P1 value), `MOV @R0,#0Fh` to
+   `RAM[0x17]` (initial state-machine state = 0x0F), then DIP-switch
+   read on P1.4 / P1.5 to choose timer-reload and display-size limits
+   (see §5).
+7. **Clear display** via `CALL 0x0256` (writes 0x00 to every cell across
+   all banks).
+8. Enable interrupts (`EN I`, then `EN TCNTI` after one synthetic
+   counter-ISR call) and fall into the main loop at 0x00D2.
+
+---
+
+## 5. Hardware-strap (DIP-switch) reads at start-up
+
+```
+00AE: 09        IN A,P1
+00AF: B1 E5     MOV @R1,#E5h     ; default RAM[0x14]
+00B1: B0 20     MOV @R0,#20h     ; default RAM[0x16]
+00B3: B2 BD     JB5 00BDh        ; if P1.5 set, keep defaults
+00B5: B1 F2     MOV @R1,#F2h     ; else RAM[0x14] = 0xF2
+00B7: B0 C0     MOV @R0,#C0h     ;      RAM[0x16] = 0xC0
+00B9: 92 BD     JB4 00BDh        ; if P1.4 set, keep those values
+00BB: B0 60     MOV @R0,#60h     ; else RAM[0x16] = 0x60
+```
+
+So two switch bits select one of three operating modes:
+
+| P1.5 | P1.4 | RAM[0x14] (timer reload) | RAM[0x16] (display-bank limit) |
+|------|------|---------------------------|--------------------------------|
+| 1 | x | 0xE5 | 0x20 |
+| 0 | 1 | 0xF2 | 0xC0 |
+| 0 | 0 | 0xF2 | 0x60 |
+
+`RAM[0x16]` is the upper-nibble cap for the display-bank-advance helper at
+0x0393 (`IN P2 → ADD #0x10 → wrap when nibble matches RAM[0x16]`). With a
+40-cell-wide row addressed by `R1 = 0..0x3F`, the three modes correspond
+to **2, 6 or 12 display rows** (for 80, 240 or 480 character cells total).
+
+`RAM[0x14]` is loaded into the 8035 timer/counter (`MOV T,A`) by the
+counter ISR on each tick; together with the T1 input clock it sets the
+interrupt frequency, which drives cursor blink.
+
+---
+
+## 6. Main loop and ring buffer
+
+```
+00D2: MOV  R0,#19h
+00D4: MOV  A,@R0       ; A = RAM[0x19] (write head, set by RX ISR)
+00D5: DEC  R0          ; R0 = 0x18
+00D6: XRL  A,@R0       ; A ^= RAM[0x18] (read tail)
+00D7: JZ   00D2h       ; ring empty -> idle
+00D9: STOP TCNT
+00DA: IN   A,P2        ; save P2
+00DB: MOV  R3,A
+00DC: INC  @R0         ; advance read tail
+00DD: MOV  A,@R0
+00DE-00E2: rotate twice + ORL #0xC0 + OUTL P2  ; select display bank for next access
+00E3: MOV  A,@R0
+00E4: ANL  A,#3Fh
+00E6: MOV  R0,A        ; R0 = ring index modulo 64
+00E7: MOVX A,@R0       ; pull next received char from ring
+00E8: MOV  R2,A        ; R2 = char (now in `received-character` register convention)
+00E9: MOV  A,R3
+00EA: OUTL P2,A        ; restore P2
+00EB: CALL 010Ah       ; dispatch
+00ED: STRT CNT
+00EE: JMP  00D2h
+```
+
+So the system uses a **64-byte ring buffer in external RAM** (low 0x40),
+with `RAM[0x18]` as read tail and `RAM[0x19]` as write head. The RX ISR
+appends, the main loop drains. The dispatcher (`CALL 010Ah`) is the same
+state machine that the previous report described; the cleaned-up dump
+just lets us read the state-handler code reliably.
+
+---
+
+## 7. Receive ISR (0x033A)
+
+```
+SEL  RB1
+MOV  R7,A; MOV A,R0; MOV R2,A    ; save A and R0 in bank 1
+MOV  R0,#80h
+MOVX A,@R0                       ; A = received byte
 MOV  R4,A
-MOV  R0,#14h
-MOV  A,@R0          ; load reload from RAM[14h]
-MOV  T,A
-STRT CNT            ; re-arm counter
-IN   A,P1
-MOV  R0,#15h
-XRL  A,@R0          ; XOR with mask in RAM[15h]
-OUTL P1,A           ; toggle P1 bits (LED/buzzer/soft-UART)
-MOVX A,@R1
-XRL  A,#80h
-MOVX @R1,A          ; toggle bit 7 at display cursor cell (blink)
+MOV  R0,#84h
+MOVX A,@R0                       ; A = status
+ANL  A,#38h                      ; mask FE | OE | PE
+JZ   continue
+   MOV R0,#8Ch
+   MOV A,#15h
+   MOVX @R0,A                    ; reset error flags via CR
+   MOV R4,#0FFh                  ; mark byte invalid
+continue:
+MOV  A,R1                        ; R1 = ring write head
+INC  A
+XRL  A,R2                        ; about to overwrite the read tail?
+JZ   skip                        ; yes -> drop the byte (full buffer)
+INC  R1
+IN   A,P2                        ; save P2
+MOV  R3,A
+MOV  A,R1
+ANL  A,#3Fh
+MOV  R0,A                        ; ring index
+MOV  A,R1
+RR A; RR A; ORL A,#0C0h
+OUTL P2,A                        ; select RX-buffer bank in P2 upper nibble
 MOV  A,R4
-MOV  R0,A
+MOVX @R0,A                       ; store byte in ring
+MOV  A,R3
+OUTL P2,A                        ; restore P2
+skip:
+MOV  A,R2
+MOV  R0,A                        ; restore R0
 MOV  A,R7
 RETR
 ```
 
-Two observations:
-* `STRT CNT` puts the timer in **counter** mode — T1 is a physical clock driving the tick. The tick period therefore depends on whatever T1 is wired to (likely a divided-down baud or line-rate clock).
-* The ISR toggles bit 7 of the display cell at `@R1` each tick. That is the **cursor blink**.
+That's the standard "single-producer-from-ISR / single-consumer-from-main"
+pattern with overflow drop.
 
-### SCN2661 RxRDY handler (0x033A)
+---
+
+## 8. Protocol state machine
+
+State held in `RAM[0x17]`. Initialised to `0x0F`. Dispatched via
+`JMPP @A` at 0x010E using a 16-byte table at 0x010F:
 
 ```
-SEL  RB1              ; switch to bank 1
-MOV  R7,A
-MOV  A,R0; MOV R2,A   ; save R0
-MOV  R0,#80h
-MOVX A,@R0            ; A = received byte
-MOV  R4,A
-MOV  R0,#84h
-MOVX A,@R0            ; A = status
-ANL  A,#38h           ; mask FE|OE|PE
-JZ   0x0350           ; no error -> continue
-MOV  R0,#8Ch
+010F:  1B 80 62 4E 15 17 44 20 54 20 24 46 FA F2 38 D3
+         ^state 0x0F              ^state 0x14    ^state 0x18
+        0x10: 0x80 -> 0x0180   0x14: 0x15 -> 0x0115  ...
+```
+
+The active states and their handlers (low-byte-of-PC after `JMPP`):
+
+| State | Entered after | Handler | What it does |
+|-------|--------------|---------|--------------|
+| 0x0F | reset / ETX | 0x011B | look for STX, DC1, DC3, DC4 in received byte; otherwise discard. |
+| 0x10 | DC4 (0x14) | 0x0180 | wait for `T0` low (= TxRDY), transmit `0x14` then transmit the received byte. **Slave response path.** |
+| 0x11 | STX (0x02) | 0x0162 | text mode: ETX returns to 0x0F; DC3 transitions to 0x14; otherwise display the byte at R1, advance cursor, stay in 0x11. |
+| 0x12 | DC1 (0x11) | 0x014E | display the next byte at R1 once, then return to 0x0F. |
+| 0x13 | DC3 (0x13) | 0x0115 | (handler points into a routine at 0x0115; not yet fully traced, but stays in the dispatcher area). |
+
+Bytes with the high bit set are masked to `0x7F` (DEL) before being
+written to display memory in both the DC1 and STX paths. This is
+**software-level filtering of multi-drop control bytes**, not a parity
+strip — the SCN2661 already removes the parity bit. Any wire byte with
+bit 7 set is treated as a control / address byte and is *not* allowed to
+appear directly on the screen via these handlers; the firmware uses bit
+7 of the display-memory byte separately, as a "visible / cursor" flag
+that the timer ISR toggles for blink.
+
+So the user-visible protocol primitives are:
+
+* `STX <chars...> ETX` — write a sequence of characters at the cursor.
+* `DC1 <char>` — write one character at the cursor.
+* `DC3` (inside STX block) — transition to a sub-state.
+* `DC4 <char>` — slave response: terminal echoes `0x14 <char>` back over
+  the line (this is the multi-drop poll-and-respond mechanism).
+* Inside text mode, the high-nibble dispatcher at 0x0220 (in the
+  previous report) further subdivides bytes `0x30..0x57` as cursor
+  positions (decoded BCD via the page-3 table at 0x0300), `0xC0`/`0xC1`
+  as fill commands, and so on.
+
+---
+
+## 9. Memory map (external, via `MOVX` with P2 upper nibble as bank)
+
+| `MOVX` address | Meaning |
+|----------------|---------|
+| `R1 = 0x00..0x3F`, P2 upper = `0xC?` | RX ring buffer (64 bytes) |
+| `R0` arbitrary, P2 upper = bank `0x00..RAM[0x16]` step `0x10` | display memory cells |
+| `R0 = 0x80`, P2 = (any) | SCN2661 RHR/THR |
+| `R0 = 0x84` | SCN2661 status register |
+| `R0 = 0x88` | SCN2661 mode registers (MR1 then MR2 on consecutive accesses) |
+| `R0 = 0x8C` | SCN2661 command register |
+
+The SCN2661 is selected by CPU address bit A7; CPU A2/A3 drive the
+USART's RS0/RS1.
+
+---
+
+## 10. What the corrected dump changed vs. the previous one
+
+Compared to the earlier (corrupted) read, the new dump:
+
+* **Halves are now 99.5 % identical** (only 5 isolated bytes differ, all
+  single-bit flips that look like residual reader noise). The previous
+  dump had hundreds of differing bytes between halves which led to a
+  spurious "two co-existing variants" hypothesis.
+* **Adds the entire SCN2661 init block** at 0x0082-0x00A3. This wasn't
+  visible in the previous dump because the bytes were garbled into
+  nonsense. The earlier report's claim that "MR1 / MR2 are never
+  programmed" is incorrect — that was an artefact of the bad dump.
+* **Adds the DIP-switch reads** at 0x00AE-0x00BB.
+* **Adds the main loop** at 0x00D2-0x00EE (ring buffer drain).
+* **Adds the slave-response transmit code** at 0x0183-0x018E (the DC4
+  handler that proves the terminal does transmit). The previous report
+  said "no write to THR found"; this is also wrong — there is one in the
+  init self-test (0x0093) and one in the DC4 handler (0x0189).
+
+---
+
+## 11. Recommendations for a replacement firmware
+
+Now that we know the SCN2661 setup, we can simply reuse it (or change
+it) and write to the same external addresses for display memory:
+
+```assembly
+; --- one-shot UART init for replacement firmware ---
+MOV  R0,#88h       ; MR address
+MOV  A,#5Eh
+MOVX @R0,A         ; MR1: async 1x, 6 bits, odd parity, 2 stop
+MOV  A,#3Eh
+MOVX @R0,A         ; MR2: BRG @ 9600, both clocks from BRG
+
+MOV  R0,#8Ch       ; CR address
 MOV  A,#15h
-MOVX @R0,A            ; reset errors
-MOV  R4,#0FFh         ; mark byte as "bad"
-...                   ; invoke state dispatcher with R2 (or R4) = received char
-RETR
+MOVX @R0,A         ; normal ops, TxEN, RxEN, clear errors
 ```
 
-`0x15 = 0001_0101b` in the SCN2661 command register = TxEN + RxEN + ResetError, normal operation, no break, no DTR/RTS.
+For a parity-less 8-bit replacement we can change MR1 to `0x4E` (drop
+the parity-enable bit) — same framing minus parity, useful while
+debugging since most async test gear defaults to 8N1.
+
+Display writes, cursor advance and screen clear can copy the original
+code 1:1 (`MOVX @R1,A`, `OR bit 7`, `OUTL P2` for bank select). The BCD
+position table at 0x0300 is a useful starting point if you want to honour
+the original `STX <bcdpos> <char> ETX` framing.
 
 ---
 
-## 7. Receive-protocol state machine
+## 12. Open verification items
 
-The firmware keeps the current protocol state in **RAM[0x17]**. Every
-received character goes through:
-
-```
-MOV  R0,#17h
-MOV  A,@R0
-JMPP @A              ; dispatch via page-local table
-```
-
-This jumps via a table at offset 0x10F (first copy) / 0x50F (second copy)
-in the current code page. The two copies are byte-for-byte identical, which
-confirms they are not two modes but two necessary copies for `JMPP @A`
-page-locality.
-
-### State values (from RAM[0x17])
-
-| State | Entered on | Next-byte behaviour |
-|-------|-----------|----------------------|
-| 0x0F | Default / after ETX | Look for control chars STX/DC1/DC3/DC4 (and ETX in second copy). Everything else is ignored. |
-| 0x10 | After DC4 (0x14) | Alt handler at 0x0180 (function not fully decoded). |
-| 0x11 | After STX (0x02) | "Text mode". Next byte is routed through the high-nibble dispatcher at 0x0220 (position / displayable / command). |
-| 0x12 | After DC1 (0x11) | Displays the next byte directly. |
-| 0x13 | After DC3 (0x13) | Branches through `JMP 0x0220` (same as text mode but no position preamble). |
-
-### Control characters recognised in state 0x0F
-
-| Code | ASCII | Observed action |
-|------|-------|-----------------|
-| 0x02 | STX | state = 0x11 |
-| 0x03 | ETX | state = 0x0F (only in second copy of the dispatcher) |
-| 0x11 | DC1 / XON | state = 0x12 |
-| 0x13 | DC3 / XOFF | state = 0x13 |
-| 0x14 | DC4 | state = 0x10 |
-
-Any other byte in state 0x0F is discarded.
-
-### High-nibble dispatcher (0x0220, second copy at 0x02A0)
-
-In text mode the received byte is dispatched by its high nibble:
-
-| Byte range | Handler | Action |
-|------------|---------|--------|
-| 0x00-0x0F | 0x02E5 | control / effect (bell? line attribute?) |
-| 0x10-0x2F | 0x024B | reject, reset state |
-| 0x30-0x4F | 0x022A | **cursor-position byte**: `A -= 0x30`, then `MOVP3 A,@A` on page 3 gives BCD pos 00..39; R1 becomes the new display address; bit 7 of the new cell is set (cursor). |
-| 0x50-0x57 | 0x0225→0x022A | same as above (extends position range up to 'W' → pos 39). |
-| 0x58-0x7F | 0x024B | reject. |
-| 0x80-0x8F | 0x0236 | **display byte with P2 bank-select**: the SWAP'd high nibble is OUT'd to P2 before the display write; used for addressing a second display bank or attribute byte. |
-| 0x90-0xBF | 0x024B | reject. |
-| 0xC0 | 0x0256→0x025C | **fill display with 0x00**. |
-| 0xC1 | 0x025A→0x025C | **fill display with 0x20 (space) — screen clear**. |
-| 0xC2-0xC8 | 0x02B* | additional indirect-dispatched commands (not fully decoded). |
-| 0xC9-0xFF | 0x024B | reject. |
-
-The displayable character written to memory is always masked to 7 bits
-(`ANL A,#7Fh`) and bit 7 is re-set afterwards as the "valid / visible"
-flag — this is what the timer ISR toggles for blink.
-
-### BCD position table (page 3, 0x0300-0x0339)
-
-Index (char − 0x30) → BCD(pos):
-
-```
-'0'(0x30) -> 00    '9'(0x39) -> 09    ':'(0x3A) -> 10    'W'(0x57) -> 39
-```
-
-i.e. pos = high_nibble*10 + low_nibble (pure BCD). The display therefore
-has 40 logical positions, addressed as two BCD digits. This is almost
-certainly a **hardware row/column decoding** scheme — the display
-controller's address counter is likely driven from BCD decoders.
-
----
-
-## 8. Multi-drop addressing (RS-422/485)
-
-When a received byte has bit 7 set (i.e. is in 0x80..0xFF), the dispatcher
-at 0x0236 SWAPs it and drives the high nibble onto P2 before writing the
-data portion. Additionally, at 0x015E (reached via `JB7 015Eh` from the
-state machine) the firmware executes:
-
-```
-INS  A,BUS   ; read the 8035 BUS port (tri-state external device)
-DEC  A
-...
-```
-
-This is the classic hardware pattern for reading **DIP-switch straps** into
-the CPU. The value is then compared against an offset stored in RAM[0x16]
-inside the 0x80-0x8F handler. The interpretation is:
-
-* The upstream host uses a 9th-bit / high-bit-marker addressing scheme.
-* A frame whose 9th bit is set is an *address* frame; only the addressed
-  terminal proceeds to accept the subsequent data characters.
-* Each terminal's address is latched from DIP switches on the BUS pins.
-
-This fits the observed RS-422/485 signalling on the upstream port.
-
----
-
-## 9. SCN2661 configuration
-
-**There is no write to MR1 / MR2 (address 0x88) anywhere in the ROM.**
-
-Consequences:
-* The USART's character format (async/sync, data bits, parity, stop bits)
-  is **not programmed in firmware**.
-* The **baud rate** is not programmed either: the built-in BRG would
-  require writing MR2; since that never happens, the chip is running on
-  the external RxC/TxC clock inputs.
-* The only SCN2661 register the firmware writes is CR (0x8C) with `0x15`:
-  TxEN | RxEN | ResetError, operating mode 00 (normal).
-
-The only plausible interpretation is that the host link is **synchronous**
-(address / data framing with a 9th-bit marker, as per §8), clocked by an
-external bit-rate generator shared by host and terminal. To pin this down
-physically:
-
-1. Scope pin 9 (RxC) and pin 25 (TxC) of the SCN2661 — that's the bit
-   rate.
-2. Scope the RS-422/485 differential pair — framing (SYN chars, address
-   byte) will be visible once you capture a burst from the real host.
-
----
-
-## 10. Three physical ports
-
-There is only one SCN2661 in the design, so the two downstream female DE9
-ports must be handled differently. Evidence:
-
-* Heavy use of `IN A,P1` / `OUTL P1,A` and the timer-ISR XOR of P1 with a
-  mask from RAM[0x15] is consistent with a **bit-banged soft UART** whose
-  bit clock is provided by the T1-driven timer tick.
-* `MOVD P5,A`, `ANLD P5,A`, `MOVD P7,A`, `ORLD P7,A` drive individual
-  lines on the 8243 expander — candidates for the Tx/Rx/handshake lines of
-  the two downstream async ports.
-* The many `JT1` / `JNT1` tests scattered through the code are polls on T1
-  — another signal that could be the incoming start-bit of a soft-UART
-  channel.
-
-The hypothesis is: **upstream sync link via SCN2661; downstream async
-links via software, clocked by the timer interrupt**. That is consistent
-with the "DTE male upstream, DTR/DCE female downstream" port assignment
-and with typical late-70s retail/industrial terminals where the device
-acted as a small multiplexer between a sync master and a couple of
-character-mode accessories (keyboard, wand, printer).
-
----
-
-## 11. What we *don't* know from the firmware alone
-
-* The **character encoding** used on the wire — the firmware only knows
-  7-bit codes and writes them to the display cell. The character ROM
-  (not yet dumped) turns those codes into dot patterns. Until the
-  char-gen EPROM is read we don't know whether the display font is ASCII,
-  an EBCDIC subset, Siemens-specific, DIN-66003 with German diacritics,
-  etc.
-* The exact meaning of commands **0xC2..0xC8** (indirect-dispatched from
-  the 0x024D handler). Likely cursor-home / attribute / line-clear
-  variants.
-* Whether the downstream ports are truly RS-232 async or something
-  proprietary; without the schematic and a device to probe the port, we
-  cannot verify.
-* The T1 clock frequency — and therefore the timer-ISR period and the
-  soft-UART bit rate — needs measurement.
-
----
-
-## 12. Recommendations for a replacement firmware
-
-1. **Physical measurements first**
-   * Capture RxC/TxC on the SCN2661 — this tells you the line speed.
-   * Capture T1 — tells you the soft-UART bit clock and cursor-blink
-     period.
-   * Read the character-generator EPROM and dump the font to confirm the
-     display character set.
-
-2. **UART initialisation (replacement firmware)**
-   Explicitly program MR1 and MR2 once after reset. For 9600 baud 8N1
-   async with a 4.9152 MHz BRG crystal on the SCN2661:
-
-   ```
-   MOV  R0,#8Ch  ; CR
-   MOV  A,#10h
-   MOVX @R0,A    ; reset chip
-
-   MOV  R0,#88h  ; MR
-   MOV  A,#4Eh   ; MR1: async 16x, 8 data, 1 stop, no parity
-   MOVX @R0,A
-   MOV  A,#EEh   ; MR2: internal BRG at 9600 baud, TxC+RxC from BRG
-   MOVX @R0,A
-
-   MOV  R0,#8Ch
-   MOV  A,#27h   ; CR: DTR, RxEN, TxEN, normal operate
-   MOVX @R0,A
-   ```
-
-   The exact MR2 nibble depends on the actual crystal; values from the
-   SCN2661 data sheet table 5 (the bit-rate code) apply.
-
-3. **Display write path — keep the existing contract**
-   * Write 7-bit character to `@R1` via `MOVX`.
-   * Follow with `MOVX A,@R1 ; ORL A,#80h ; MOVX @R1,A` to mark the cell
-     visible.
-   * Cursor auto-increment can just `INC R1`, wrapping at the BCD-encoded
-     end of the row.
-
-4. **Minimal command set the replacement should accept**
-   * `0x0C` (FF) or `0xC1`: clear screen (fill with 0x20).
-   * `0x0D` (CR): `R1 = R1 & 0xF0` (back to column 0 of current row).
-   * `0x0A` (LF): advance to next row (BCD arithmetic on R1).
-   * `0x08` (BS): `DEC R1` (with row-underflow guard).
-   * Any other 0x20..0x7E: write at cursor, advance.
-   * Optional ANSI-like `ESC [ y ; x H` for cursor positioning, or keep
-     the legacy `STX <bcdpos>` if interoperability with the original host
-     is needed.
-
-5. **Skip the sync/multi-drop address decoding** unless you also need
-   compatibility with the existing master. For a stand-alone async
-   viewer, ignore the DIP switches and accept every byte.
-
-6. **Timer ISR** still needed for cursor blink. Keep the existing
-   toggle-bit-7-at-@R1 trick; with the replacement firmware you can drive
-   the timer from the internal prescaler (`STRT T`) instead of the
-   hardware-clocked counter (`STRT CNT`) so that the blink rate no longer
-   depends on the upstream clock.
+1. **Scope the SCN2661's RxC pin.** With 16× oversampling at 9600 baud
+   it should be exactly 153.6 kHz. If you instead see 9600 Hz the chip
+   is in 1× mode and our MR1 decode is wrong; if you see another
+   frequency the BRG input clock isn't what the standard table assumes.
+2. **Identify the T0 source on the PCB.** It should be wired to the
+   SCN2661's TxRDY (or its complement). The DC4 handler busy-waits on
+   T0 before each transmit byte.
+3. **Find the second 8243 expander port destinations** to confirm the
+   downstream-DE9 routing hypothesis.
+4. **Re-dump the EPROM once more** and diff against the current dump to
+   confirm those 5 remaining bit-level differences are reader noise and
+   not real content.
 
 ---
 
 ## 13. Deliverables produced during this analysis
 
-* `dis8048.py` — a small MCS-48 disassembler, with flow-following trace
-  from the reset and interrupt vectors.
-* `disasm48.txt` — disassembly of the full 2 KiB ROM.
-* `siemens-9772.bin` — the hex dump converted to a raw binary.
-
-These are sufficient to continue the reverse-engineering, to experiment
-with replacement code, and to cross-check anything noted above against
-the exact byte sequences.
+* `dis8048.py` — MCS-48 disassembler with flow-following trace.
+* `disasm48.txt`, `disasm48-v2.txt` — disassembly listings (the v2 file
+  is from the corrected dump).
+* `siemens-9772.bin` — current binary derived from the latest hex dump.
+* `siemens-9772-chargen.{bin,hex}`, `render_chargen.py`,
+  `siemens-9772-chargen.png` — character-generator EPROM and rendering.
