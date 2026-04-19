@@ -19,17 +19,21 @@ Protocol summary (extracted from firmware disassembly):
                          bit 7 set are forced to 0x7F (DEL) before display.
 
     DC3-escape commands (following a DC3 either in default or text mode):
+        0x08          -> transmit `0x12 0x20` (status response)
+        0x09          -> transmit `0x12 <id>` where <id> is the slave address
+                          read from DIP switches: 0x01, 0x02 or 0x04
         0x30-0x57     -> set cursor to BCD column 0..39 within current row
         0x80-0x8F     -> set display bank/row (P2 upper nibble = cmd & 0x0F)
-        0xC0          -> fill screen with 0x00
-        0xC1          -> fill screen with 0x20 (space) -- "clear screen"
-        0xC2          -> bank-by-bank fill with 0x00
-        0xC3          -> transmit 0x12 + saved-status back (status report)
-        0xC4          -> another fill variant (0x00 via lookup)
-        0xC5          -> fill with 0x20 via lookup
+        0xC0          -> fill current bank with 0x00
+        0xC1          -> fill current bank with 0x20 (space) -- "clear screen"
+        0xC2          -> all banks invisible + fill bank 0 with 0x00
+        0xC3          -> transmit `0x12 0x80` (status report)
+        0xC4          -> clear current row to 0x00, cursor home
+        0xC5          -> clear current row to 0x20, cursor home
         0xC6          -> start attribute-blink mode A (toggle P1.0 each tick)
         0xC7          -> start attribute-blink mode B (toggle P1.1 each tick)
         0xC8          -> stop attribute blink (freeze current state)
+        anything else -> reset to default state
 
     DC4 (0x14) slave-response:
         terminal waits for T0 low (TxRDY), then transmits 0x14 followed
@@ -70,17 +74,22 @@ except ImportError:
 
 STX = 0x02
 ETX = 0x03
+BS  = 0x08
+TAB = 0x09
 DC1 = 0x11
+DC2 = 0x12      # response prefix (terminal -> host)
 DC3 = 0x13
 DC4 = 0x14
 
-# DC3-escape commands
+# DC3-escape commands (the byte sent after a DC3)
+CMD_STATUS_QUERY    = BS    # 0x08: tx 0x12 0x20
+CMD_ADDRESS_QUERY   = TAB   # 0x09: tx 0x12 <slave-id>  (0x01/0x02/0x04)
 CMD_FILL_NULL       = 0xC0
 CMD_CLEAR_SCREEN    = 0xC1  # fill with space (0x20)
-CMD_FILL_NULL_BANK  = 0xC2
-CMD_STATUS_REPORT   = 0xC3  # transmits 0x12 + status
-CMD_FILL_NULL_LU    = 0xC4
-CMD_FILL_SPACE_LU   = 0xC5
+CMD_HIDE_ALL        = 0xC2  # bit-7-clear every cell + fill bank 0 with 0x00
+CMD_STATUS_REPORT   = 0xC3  # transmits 0x12 0x80
+CMD_CLEAR_ROW_NULL  = 0xC4  # clear current row to 0x00, cursor home
+CMD_CLEAR_ROW_SPACE = 0xC5  # clear current row to 0x20, cursor home
 CMD_BLINK_A_START   = 0xC6  # P1.0 toggling -> cursor blink
 CMD_BLINK_B_START   = 0xC7  # P1.1 toggling -> alt blink
 CMD_BLINK_STOP      = 0xC8
@@ -176,11 +185,24 @@ class Terminal:
     def blink_b(self):      self.send(DC3, CMD_BLINK_B_START)
     def blink_off(self):    self.send(DC3, CMD_BLINK_STOP)
 
-    def status_report(self, expect_bytes: int = 2, timeout: float = 1.0) -> bytes:
-        """DC3 0xC3 tells the terminal to transmit 0x12 + status."""
+    def status_report(self, timeout: float = 1.0) -> bytes:
+        """DC3 0xC3 -> expect `0x12 0x80` back."""
         self.ser.reset_input_buffer()
         self.send(DC3, CMD_STATUS_REPORT)
-        return self.read(expect_bytes, timeout=timeout)
+        return self.read(2, timeout=timeout)
+
+    def status_query(self, timeout: float = 1.0) -> bytes:
+        """DC3 0x08 (BS) -> expect `0x12 0x20` back."""
+        self.ser.reset_input_buffer()
+        self.send(DC3, CMD_STATUS_QUERY)
+        return self.read(2, timeout=timeout)
+
+    def address_query(self, timeout: float = 1.0) -> bytes:
+        """DC3 0x09 (TAB) -> expect `0x12 <slave-id>` back. <slave-id> is
+        0x01, 0x02 or 0x04 depending on the DIP switches read at boot."""
+        self.ser.reset_input_buffer()
+        self.send(DC3, CMD_ADDRESS_QUERY)
+        return self.read(2, timeout=timeout)
 
     def dc4_ping(self, payload: int = 0x00, timeout: float = 1.0) -> bytes:
         """Slave-poll: terminal echoes 0x14 <payload> back to the host."""
@@ -293,8 +315,14 @@ def demo_ping(t: Terminal):
 
 
 def demo_status(t: Terminal):
-    reply = t.status_report()
-    print(f"DC3 0xC3 status -> {reply.hex(' ') if reply else '(no reply)'}")
+    """Exercise all three response paths."""
+    for label, fn in [
+        ("DC3 0xC3 (status report)", t.status_report),
+        ("DC3 0x08 (BS / status query)", t.status_query),
+        ("DC3 0x09 (TAB / address query)", t.address_query),
+    ]:
+        reply = fn()
+        print(f"  {label:32s} -> {reply.hex(' ') if reply else '(no reply)'}")
 
 
 def demo_single(t: Terminal):

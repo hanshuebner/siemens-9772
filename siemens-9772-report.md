@@ -36,9 +36,11 @@ controller. The firmware:
   as a TxRDY handshake to the SCN2661.
 
 There is therefore a serial-line protocol with a clear multi-drop flavour:
-the master sends a DC4 + slave-id, the addressed slave answers via the
-local UART path. Display data uses STX as start-of-frame and ETX as
-end-of-frame.
+the master sends a DC4 + payload, the addressed slave echoes it back; the
+master can also query a slave's address explicitly with `DC3 0x09` to which
+each terminal answers with one of `0x01`/`0x02`/`0x04` (encoded by the same
+DIP switches that pick the display size). Display data uses STX as
+start-of-frame and ETX as end-of-frame.
 
 Replacing the firmware is straightforward: keep the SCN2661 init constants
 the original code uses (or change them), and write to the same external
@@ -306,14 +308,15 @@ The active states and their handlers (low-byte-of-PC after `JMPP`):
 
 | State | Entered after | Handler | What it does |
 |-------|--------------|---------|--------------|
-| 0x0F | reset / ETX | 0x011B | look for STX, DC1, DC3, DC4 in received byte; otherwise discard. |
-| 0x10 | DC4 (0x14) | 0x0180 | wait for `T0` low (= TxRDY), transmit `0x14` then transmit the received byte. **Slave response path.** |
-| 0x11 | STX (0x02) | 0x0162 | text mode: ETX returns to 0x0F; DC3 transitions to 0x14; otherwise display the byte at R1, advance cursor, stay in 0x11. |
-| 0x12 | DC1 (0x11) | 0x014E | display the next byte at R1 once, then return to 0x0F. |
-| 0x13 | DC3 (0x13) | 0x0115 | (handler points into a routine at 0x0115; not yet fully traced, but stays in the dispatcher area). |
+| 0x0F | reset / ETX / end-of-command | 0x011B | look for STX, DC1, DC3, DC4 in the received byte; everything else is silently discarded. |
+| 0x10 | DC4 (0x14) | 0x0180 | wait for `T0` low (= SCN2661 TxRDY), transmit `0x14`, wait for `T0` low again, transmit the received byte. **Slave-poll response path.** Returns to 0x0F. |
+| 0x11 | STX (0x02) | 0x0162 | text mode: ETX returns to 0x0F; DC3 transitions to 0x14; otherwise display the byte at R1 (cursor) and advance, then stay in 0x11. |
+| 0x12 | DC1 (0x11) | 0x014E | display the single next byte at R1, then return to 0x0F. |
+| 0x13 | DC3 (0x13) in default mode | 0x0115 = `JMP 0x0220` | high-nibble dispatcher with the next received byte. Each leaf handler ends with `JMP 0x0133` so state ends back at 0x0F. |
+| 0x14 | DC3 (0x13) in text mode | 0x0117 = `CALL 0x0220` then `JMP 0x0146` | high-nibble dispatcher (subroutine call); on return the trailer at 0x0146 sets the state back to 0x11 so text mode continues. |
 
 Bytes with the high bit set are masked to `0x7F` (DEL) before being
-written to display memory in both the DC1 and STX paths. This is
+written to display memory in the DC1 and STX paths. This is
 **software-level filtering of multi-drop control bytes**, not a parity
 strip — the SCN2661 already removes the parity bit. Any wire byte with
 bit 7 set is treated as a control / address byte and is *not* allowed to
@@ -321,17 +324,50 @@ appear directly on the screen via these handlers; the firmware uses bit
 7 of the display-memory byte separately, as a "visible / cursor" flag
 that the timer ISR toggles for blink.
 
+### DC3-escape command set (full)
+
+The high-nibble dispatcher at 0x0220 (`MOV A,R2; ANL A,#0xF0; SWAP A;
+JMPP @A` with table at 0x0200) routes the byte that follows DC3:
+
+| `DC3 + byte` | Action |
+|--------------|--------|
+| `0x00..0x07`, `0x0A..0x0F` | reset state; no other side effect |
+| `0x08` | transmit `0x12 0x20` back to host (status response with sub-code 0x20) |
+| `0x09` | transmit `0x12 <id>` back to host, where `<id> = 0x01` (P1.5=1), `0x04` (P1.5=0,P1.4=1) or `0x02` (both 0). **Slave-address query.** |
+| `0x10..0x2F` | reject (reset state) |
+| `0x30..0x57` | move cursor to BCD column 0..39 within current row; the page-3 lookup at 0x0300 maps `'0'..'9',':'..'W'` to positions 0..39 |
+| `0x58..0x7F` | reject |
+| `0x80..0x8F` | select display row/bank: `OUTL P2, (byte<<4)`. The bank is range-checked against `RAM[0x16]` (the DIP-switch-set limit) |
+| `0x90..0xBF` | reject |
+| `0xC0` | fill current bank with `0x00` |
+| `0xC1` | fill current bank with `0x20` (clear screen to spaces) |
+| `0xC2` | walk every bank `0x10..RAM[0x16]` and clear bit 7 of every cell, then fill bank 0 with `0x00` (full screen "go invisible") |
+| `0xC3` | transmit `0x12 0x80` back to host (status response with sub-code 0x80) |
+| `0xC4` | clear current row to `0x00`, cursor home |
+| `0xC5` | clear current row to `0x20`, cursor home |
+| `0xC6` | start attribute-blink mode A: timer ISR toggles `P1.0` every tick |
+| `0xC7` | start attribute-blink mode B: timer ISR toggles `P1.1` every tick |
+| `0xC8` | stop attribute blink (helper at 0x029B clears the toggle mask in `RAM[0x15]` and freezes P1 in its initial post-self-test state: `P1.0=1`, `P1.1=0`) |
+| `0xC9..0xFF` | reject (`ADD A,#0x37` carries; goes to reset-state path) |
+
 So the user-visible protocol primitives are:
 
 * `STX <chars...> ETX` — write a sequence of characters at the cursor.
+* `STX ... DC3 <esc> ...` — issue an escape command in the middle of
+  text (e.g. `STX DC3 <bank> DC3 <col> "Hello" ETX` to position then
+  write).
 * `DC1 <char>` — write one character at the cursor.
-* `DC3` (inside STX block) — transition to a sub-state.
-* `DC4 <char>` — slave response: terminal echoes `0x14 <char>` back over
-  the line (this is the multi-drop poll-and-respond mechanism).
-* Inside text mode, the high-nibble dispatcher at 0x0220 (in the
-  previous report) further subdivides bytes `0x30..0x57` as cursor
-  positions (decoded BCD via the page-3 table at 0x0300), `0xC0`/`0xC1`
-  as fill commands, and so on.
+* `DC3 <esc>` (outside STX) — issue a one-shot escape command (clear,
+  position, status, blink-mode, …) and stay in default mode.
+* `DC4 <char>` — slave-poll: terminal echoes `0x14 <char>` back. Used
+  by the master to ping/probe slaves on the RS-422/485 bus.
+
+The bus-level multi-drop addressing falls out of three primitives in
+combination: (1) the boot DIP-switch read sets per-slave behaviour, (2)
+`DC3 0x09` lets the master query each slave's address bit (`0x01`,
+`0x02`, or `0x04`), (3) `DC4 <byte>` lets the master probe a specific
+slave and have it echo back. Three-slave bus, single-bit collision-free
+addressing.
 
 ---
 
