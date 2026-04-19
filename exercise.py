@@ -245,41 +245,30 @@ def demo_chargen(t: Terminal):
 
 
 def demo_umlaut(t: Terminal):
-    """Show the German upper-page glyphs (Ö Ü ^ Ä and ö ü ß ä).
+    """Show the chargen's upper-page glyphs.
 
-    Writing a char with bit 7 set via STX/DC1 gets filtered to 0x7F by the
-    firmware (multi-drop control-byte guard). To reach the upper chargen
-    page we have to drive P2.upper via the 0x80-0x8F bank-select escape,
-    then put a normal 7-bit char there. (If the hardware maps the upper
-    chargen page differently on a given unit, this is the demo to check.)
+    Per the firmware/chargen analysis, codes 0x5B-0x5E and 0x7B-0x7E
+    are remapped by hardware on the display board to the upper chargen
+    page. With the German MODE strap they show:
+
+        0x5B -> Ä   0x5C -> Ö   0x5D -> Ü   0x5E -> ^
+        0x7B -> ä   0x7C -> ö   0x7D -> ü   0x7E -> ß
+
+    With the ASCII MODE strap the same codes show the original
+    `[ \\ ] ^` / `{ | } ~` glyphs.
+
+    No special escape is needed -- send them as plain ASCII bytes inside
+    a normal STX...ETX text block. This demo therefore tells you which
+    way the MODE strap is set on your unit by what shows up on screen.
     """
     t.clear_screen()
     time.sleep(0.2)
-    samples = [
-        (0x80, "Oe"),
-        (0x81, "Ue"),
-        (0x82, "^^"),
-        (0x83, "Ae"),
-        (0xA0, "oe"),
-        (0xA1, "ue"),
-        (0xA2, "ss"),
-        (0xA3, "ae"),
-    ]
-    for i, (code, label) in enumerate(samples):
-        row, col = divmod(i, 4)
-        row += 0          # all on row 0/1
-        col = col * 8
-        t.send(STX)
-        t.send(DC3, row_byte(row))
-        t.send(DC3, col_byte(col))
-        # Select bank for upper chargen page - if the display uses P2.4-P2.7
-        # as an extra address line into the chargen, this is how we flip it.
-        t.send(DC3, 0x80 + (code >> 4))
-        t.send(code & 0x7F)  # masked by firmware
-        t.send(ETX)
-        # tag each glyph with its ASCII fallback label
-        t.write_text(row, col + 2, label)
-        time.sleep(0.2)
+    # Row 0: the eight test codes
+    t.write_text(0, 0, "[\\]^{|}~  <- as wire bytes")
+    # Row 1: their German equivalents (for the eyeball test)
+    t.write_text(1, 0, "AOU^aou")  # ASCII fallback for the German chars
+    t.write_text(2, 0, "If MODE=DE, row 0 shows AeOeUe^aeoeues")
+    t.write_text(3, 0, "If MODE=US, row 0 shows the brackets/curly")
 
 
 def demo_positions(t: Terminal):

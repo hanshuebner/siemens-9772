@@ -13,8 +13,17 @@ Of the 256 slots, 152 are the "unused placeholder" pattern (a full 5x7
 solid block, bytes 7f 7f 7f 7f 7f 00 00 00). The slot at 0x20 (SPACE) is
 the only all-zero cell.
 
-The PNG contains all 256 character cells in a 16x16 grid. Each chargen
-pixel is drawn as a 4x4 block of PNG pixels.
+The 0x80-0x87 / 0xA0-0xA7 region of the chargen is reached by hardware
+address-remap on the display board: when the wire byte is one of
+{0x5B,0x5C,0x5D,0x5E,0x7B,0x7C,0x7D,0x7E} (the ASCII bracket / curly-
+brace positions, which are placeholder solid blocks in the lower page),
+the display TTL forces chargen address bits A10:1, A9:0, A7:0, A6:0 and
+drives A5 from a hardware MODE strap. With MODE=0 the remap lands on
+0x80-0x83 / 0xA0-0xA3 (German DIN 66003 substitutions: Ä Ö Ü ^ ä ö ü
+ß); with MODE=1 it lands on 0x84-0x87 / 0xA4-0xA7 (ASCII brackets and
+curly braces). This is what populates the upper page of the chargen --
+those entries are not unreachable, they're reached by codes 0x5B-0x5E
+and 0x7B-0x7E.
 """
 from PIL import Image, ImageDraw, ImageFont
 

@@ -109,11 +109,16 @@ Total frame: 1 start + 8 data + 1 parity + 1 stop = **11 bit times per
 character** = standard **8O1**.
 
 Important consequence: the 8 data bits carry the full byte that the
-firmware reads, including the high bit. The chargen ROM has glyphs for
-codes 0x00-0xFF (German umlauts at 0x80-0x87 and 0xA0-0xA7), so the wire
-really does deliver 8-bit code points, and bit 7 is **software-level
-addressing / control**, not a parity bit (the SCN2661 strips the parity
-bit before the data hits the CPU).
+firmware reads, including the high bit. Bit 7 of an incoming byte is
+**software-level addressing / control** (the SCN2661 strips the parity
+bit before the data hits the CPU), and the firmware uses bit 7 to
+distinguish address / control bytes from displayable data — every byte
+with bit 7 set that arrives in the display path is forced to `0x7F`
+(DEL) by the firmware before the cell write. Display memory therefore
+only ever holds 7-bit codes, and the chargen address is the same 7-bit
+code; the umlauts and the relocated ASCII brackets / curly braces in
+the upper half of the chargen are reached not by 8-bit codes but by a
+hardware address-remap on the display board (see §11).
 
 ### MR2 = 0x3E = `0011_1110`
 
@@ -408,7 +413,63 @@ Compared to the earlier (corrupted) read, the new dump:
 
 ---
 
-## 11. Recommendations for a replacement firmware
+## 11. Character generator and the bracket / umlaut hardware remap
+
+The 2 KiB chargen EPROM stores 256 cells of 8 bytes each (5×7 glyph in
+the first 5 column-bytes, 3 columns of inter-character spacing). Bit 7
+of every chargen byte is unused — character cells are 7 pixels tall, so
+the unused 8th scan-line per cell is what the **always-on hardware
+underline** uses (no firmware involvement; see §6).
+
+The chargen ROM is wired so that the **lower 128 entries** are the
+straight ASCII glyph table (digits, letters, punctuation, with
+`0x5B-0x5E` and `0x7B-0x7E` left as solid-block placeholders). The
+**upper 128 entries** are reached by hardware address-rewrite on the
+display board, not by 8-bit codes from the firmware:
+
+| Wire byte | Address rewrite | Glyph (MODE = 0, German) | Glyph (MODE = 1, ASCII) |
+|-----------|-----------------|--------------------------|------------------------|
+| `0x5B` | → chargen `0x83` | **Ä** | `[` (chargen `0x87`) |
+| `0x5C` | → chargen `0x80` | **Ö** | `\` (chargen `0x84`) |
+| `0x5D` | → chargen `0x81` | **Ü** | `]` (chargen `0x85`) |
+| `0x5E` | → chargen `0x82` | `^` | `^` (chargen `0x86`) |
+| `0x7B` | → chargen `0xA3` | **ä** | `{` (chargen `0xA5`) |
+| `0x7C` | → chargen `0xA0` | **ö** | `\|` (chargen `0xA4`) |
+| `0x7D` | → chargen `0xA1` | **ü** | `}` (chargen `0xA7`) |
+| `0x7E` | → chargen `0xA2` | **ß** | `~` (chargen `0xA6`) |
+| `0x5F` | (no remap) | `_` | `_` |
+| `0x7F` | (no remap) | solid block | solid block |
+
+The TTL detect logic on the display board fires when the cell value
+matches `(b6=1) AND (b4=1) AND (b3=1)` AND the lower three bits are
+`011`, `100`, `101` or `110` — i.e. exactly the 8 codes in the table
+above. When it fires, the chargen address bits are forced as follows:
+
+| chargen line | normal source | rewritten value |
+|--------------|---------------|-----------------|
+| A10 (=cell b7) | 0 | **forced 1** |
+| A9 (=cell b6) | 1 | **forced 0** |
+| A8 (=cell b5) | 0 / 1 | **preserved** (this is what keeps the 0x5x → 0x80x and 0x7x → 0xA0x distinction) |
+| A7 (=cell b4) | 1 | **forced 0** |
+| A6 (=cell b3) | 1 | **forced 0** |
+| A5 (=cell b2) | varies | **driven by the MODE strap** |
+| A4, A3 | (cell b1, b0) | **preserved** |
+
+The MODE strap on the display board therefore picks which of the two
+upper-page subsets is shown for codes `0x5B-0x5E` / `0x7B-0x7E`.
+Nothing in the firmware moves between displaying "Z" and displaying
+"`{`" — the firmware just writes the 7-bit code; the hardware decides
+which glyph appears.
+
+This explains why the chargen has *both* the German DIN 66003 glyphs
+(`Ä Ö Ü ^`, `ä ö ü ß`) and the relocated ASCII brackets / curly braces
+(`\ ] ^ [`, `| { ~ }`) at *adjacent* upper-page positions — they are
+the two outputs of one MODE pin. To swap the terminal between German
+and ASCII display you flip that pin, no firmware change.
+
+---
+
+## 12. Recommendations for a replacement firmware
 
 Now that we know the SCN2661 setup, we can simply reuse it (or change
 it) and write to the same external addresses for display memory:
@@ -437,7 +498,7 @@ the original `STX <bcdpos> <char> ETX` framing.
 
 ---
 
-## 12. Open verification items
+## 13. Open verification items
 
 1. **Scope the SCN2661's RxC pin.** With 16× oversampling at 9600 baud
    it should be exactly 153.6 kHz. If you instead see 9600 Hz the chip
@@ -451,10 +512,15 @@ the original `STX <bcdpos> <char> ETX` framing.
 4. **Re-dump the EPROM once more** and diff against the current dump to
    confirm those 5 remaining bit-level differences are reader noise and
    not real content.
+5. **Identify the chargen MODE strap** on the display board. It picks
+   ASCII vs German DIN 66003 for the 8 wire codes `0x5B-0x5E` /
+   `0x7B-0x7E`. Looking at chargen pin A5: in normal operation it is
+   driven by code bit 2; the remap forces it to the MODE pin's value.
+   Probably a jumper or a single TTL gate connected to a board strap.
 
 ---
 
-## 13. Deliverables produced during this analysis
+## 14. Deliverables produced during this analysis
 
 * `dis8048.py` — MCS-48 disassembler with flow-following trace.
 * `disasm48.txt`, `disasm48-v2.txt` — disassembly listings (the v2 file
