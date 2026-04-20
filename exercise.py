@@ -50,13 +50,17 @@ This script assumes a straight two-wire connection via an RS-422/485
 transceiver onto the terminal's DTE upstream port.
 
 Usage:
-    python3 exercise.py /dev/ttyUSB0
-    python3 exercise.py /dev/ttyUSB0 --demo cycle      # run every demo
+    python3 exercise.py /dev/ttyUSB0 --demo bringup    # first-contact check
+    python3 exercise.py /dev/ttyUSB0                   # = --demo cycle
     python3 exercise.py /dev/ttyUSB0 --demo clear
     python3 exercise.py /dev/ttyUSB0 --demo chargen    # show whole charset
     python3 exercise.py /dev/ttyUSB0 --demo umlaut
     python3 exercise.py /dev/ttyUSB0 --demo blink
     python3 exercise.py /dev/ttyUSB0 --demo ping       # DC4 probe
+
+    python3 exercise.py /dev/ttyUSB0 --listen-hello    # reset the terminal
+                                                        # before running; prints
+                                                        # the 0x12 0x90 greeting
 """
 from __future__ import annotations
 
@@ -162,9 +166,28 @@ class Terminal:
         """Fill the whole display with 0x00 (all cells invisible)."""
         self.send(DC3, CMD_FILL_NULL)
 
+    def clear_row_null(self):
+        """Clear current row to 0x00 and park cursor at column 0."""
+        self.send(DC3, CMD_CLEAR_ROW_NULL)
+
+    def clear_row_space(self):
+        """Clear current row to 0x20 and park cursor at column 0."""
+        self.send(DC3, CMD_CLEAR_ROW_SPACE)
+
+    def hide_all(self):
+        """DC3 0xC2: bit-7-clear every cell on every bank, then fill bank 0
+        with 0x00. Effectively 'blank the screen but don't touch the data'
+        on the banks that were already there."""
+        self.send(DC3, CMD_HIDE_ALL)
+
     def goto(self, row: int, col: int):
-        """Move cursor to (row, col) via DC3 escapes. Not inside a text block."""
+        """Move cursor to (row, col) via DC3 escapes. Row 0 = top,
+        col 0 = left. Safe to call outside a text block."""
         self.send(DC3, row_byte(row), DC3, col_byte(col))
+
+    def home(self):
+        """Move cursor to (0, 0) - the same place the boot sequence leaves it."""
+        self.goto(0, 0)
 
     def write_text(self, row: int | None, col: int | None, s: str):
         """Write a string at (row, col). Uses STX ... ETX framing and
@@ -210,11 +233,39 @@ class Terminal:
         self.send(DC4, payload)
         return self.read(2, timeout=timeout)
 
+    def read_power_on_hello(self, timeout: float = 3.0) -> bytes:
+        """After a reset the firmware transmits 0x12 0x90 as a power-on
+        greeting. Call this immediately after opening the port / resetting
+        the terminal to confirm serial RX (host <- terminal) works."""
+        return self.read(2, timeout=timeout)
+
 
 # --- Demos ---------------------------------------------------------------
 
 def demo_clear(t: Terminal):
     t.clear_screen()
+
+
+def demo_bringup(t: Terminal):
+    """Minimal 'is the wiring right?' check.
+
+    Sends DC3 0xC1 to clear the screen to spaces (replacing the boot-time
+    0x00 dots), positions the cursor at (0, 0), writes a short string,
+    then queries the slave address. Use this as your first-ever command
+    sequence against a freshly-connected terminal."""
+    print("Clearing screen (DC3 0xC1)...")
+    t.clear_screen()
+    time.sleep(0.3)
+    print("Cursor home, writing 'HELLO 9772'...")
+    t.write_text(0, 0, "HELLO 9772")
+    time.sleep(0.3)
+    print("Asking for the slave address (DC3 0x09)...")
+    reply = t.address_query()
+    if reply:
+        print(f"  terminal replied: {reply.hex(' ')}"
+              f"   (DIP address = 0x{reply[1]:02X})" if len(reply) >= 2 else "")
+    else:
+        print("  no reply within 1s -- check TX wiring / parity")
 
 
 def demo_banner(t: Terminal):
@@ -342,6 +393,7 @@ def demo_cycle(t: Terminal):
 
 DEMOS = {
     "clear": demo_clear,
+    "bringup": demo_bringup,
     "banner": demo_banner,
     "chargen": demo_chargen,
     "umlaut": demo_umlaut,
@@ -360,11 +412,26 @@ def main():
     ap.add_argument("--baud", type=int, default=9600)
     ap.add_argument("--demo", default="cycle",
                     choices=sorted(DEMOS), help="which demo to run")
+    ap.add_argument("--listen-hello", action="store_true",
+                    help="Instead of a demo, wait up to 3 s for the "
+                         "terminal's power-on greeting (0x12 0x90) and "
+                         "print it. Reset the terminal before running.")
     args = ap.parse_args()
 
     t = Terminal(args.port, baud=args.baud)
     try:
-        DEMOS[args.demo](t)
+        if args.listen_hello:
+            reply = t.read_power_on_hello()
+            if reply:
+                print(f"received: {reply.hex(' ')}")
+                if reply == b"\x12\x90":
+                    print("  -> matches the expected power-on 0x12 0x90 greeting")
+                else:
+                    print("  -> does NOT match 0x12 0x90 - check baud/parity/reset")
+            else:
+                print("no bytes within 3 s - check wiring / reset the terminal")
+        else:
+            DEMOS[args.demo](t)
     finally:
         t.close()
 

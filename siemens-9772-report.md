@@ -179,10 +179,22 @@ handshake** instead of the modem-control lines.
    `RAM[0x17]` (initial state-machine state = 0x0F), then DIP-switch
    read on P1.4 / P1.5 to choose timer-reload and display-size limits
    (see §5).
-7. **Clear display** via `CALL 0x0256` (writes 0x00 to every cell across
-   all banks).
-8. Enable interrupts (`EN I`, then `EN TCNTI` after one synthetic
+7. **Clear display** via `CALL 0x0256` (writes `0x00` to every cell
+   across all banks). At the end of this routine `R1` is left at `0x00`
+   and `P2 upper = 0`, then bit 7 of the cell at that position is set
+   so the cursor appears at **row 0, column 0 — upper-left corner**.
+8. **Power-on "hello"**: `MOV R6,#90h; CALL 0x02AD` transmits
+   `0x12 0x90` on the serial line. Any listening host (or logic
+   analyser) sees that pair of bytes as the first traffic after reset
+   — handy sanity check that RX wiring / baud are correct.
+9. Enable interrupts (`EN I`, then `EN TCNTI` after one synthetic
    counter-ISR call) and fall into the main loop at 0x00D2.
+
+The "screen full of dots" you see on a freshly-booted terminal is
+exactly this: chargen code `0x00` is a single-pixel glyph in the
+middle of the 5×7 cell, so every cleared cell shows a dot. The
+hardware underline (see §11) is present under every cell regardless.
+The one blinking cell is `(row 0, col 0)`.
 
 ---
 
@@ -376,7 +388,65 @@ addressing.
 
 ---
 
-## 9. Memory map (external, via `MOVX` with P2 upper nibble as bank)
+## 9. Cursor model
+
+The firmware keeps cursor state in three places:
+
+| State | Where | Encoding |
+|-------|-------|----------|
+| Column within the current row | `R1` register | BCD byte in `{0x00..0x09, 0x10..0x19, 0x20..0x29, 0x30..0x39}`. The high nibble is the tens digit, the low nibble is the ones digit; only these 40 of the 64 possible `R1` values map to real display cells (the gaps `0x0A-0x0F`, `0x1A-0x1F`, `0x2A-0x2F`, `0x3A-0x3F` are unused). |
+| Current row / bank | P2 upper nibble | OUTL'd as `0x00`, `0x10`, `0x20`, … stepping by `0x10` up to `RAM[0x16]` (2, 6 or 12 rows depending on the DIP-switch mode). |
+| Visible / cursor-marker | bit 7 of the display cell at `(P2-upper, R1)` | Set to 1 when the cursor is on that cell, cleared when the cursor moves off. The timer ISR toggles this bit every tick, producing the blink. |
+
+Column 0 is the **leftmost** column; row 0 is the **topmost** row, so the
+cursor starts at the upper-left after clear (confirmed on the real
+hardware).
+
+### Cursor-move primitives
+
+1. **Absolute column** — `DC3 <0x30..0x57>` runs the wire byte through
+   the page-3 BCD lookup at `0x0300` (`'0'..'9',':','..','W'` → BCD
+   0..39) and stores the result in `R1`. The handler at `0x022A`
+   clears bit 7 of the cell being left and sets bit 7 of the new cell.
+2. **Absolute row / bank** — `DC3 <0x80..0x8F>` bounds-checks against
+   `RAM[0x16]` and then `OUTL P2, (byte<<4)` to select the bank. The
+   cell at the new `(P2, R1)` is marked visible.
+3. **Auto-advance** — helpers `0x038B` and `0x0393` run after every
+   character-write in STX mode and DC1 mode. `0x038B` does `INC R5;
+   MOVP3 A,@A; MOV R1,A`, so `R5` walks 0→1→…→39 and `R1` follows the
+   BCD table; on the fortieth call `MOVP3` returns `0` which (a) wraps
+   `R5` back to 0 and (b) triggers `CALL 0x0393` to advance to the
+   next bank. `0x0393` wraps `P2` when it reaches `RAM[0x16]`. So a
+   long text run walks left-to-right, top-to-bottom, and wraps to the
+   top-left at end-of-screen.
+4. **Home-in-row** — `DC3 0xC4` clears the current row to `0x00` and
+   puts the cursor at column 0. `DC3 0xC5` does the same with space
+   fill.
+
+### Cursor blink control
+
+Bit 7 of the cell at the cursor position is always being XOR-toggled
+by the timer ISR; the *visibility* of that toggle on the CRT is
+determined by the two attribute bits `P1.0` and `P1.1` which the ISR
+also XORs with `RAM[0x15]`:
+
+- `DC3 0xC6` — start blink mode A, i.e. `RAM[0x15] = 0x01`, so `P1.0`
+  toggles each tick.
+- `DC3 0xC7` — start blink mode B, `RAM[0x15] = 0x02`, so `P1.1`
+  toggles each tick.
+- `DC3 0xC8` — stop: the helper at `0x029B` zeroes `RAM[0x15]` and
+  forces `P1.0 = 1`, `P1.1 = 0` (the initial post-self-test state).
+
+Exactly which of `P1.0` / `P1.1` is the global cursor-visible enable
+to the CRT, and which is a secondary attribute (reverse / alt-blink /
+bell LED), is not distinguishable from the firmware alone — the two
+commands are symmetric in the code. A quick "send `DC3 0xC6`, see what
+starts blinking; send `DC3 0xC7`, see what starts blinking" test on
+the live hardware settles it.
+
+---
+
+## 10. Memory map (external, via `MOVX` with P2 upper nibble as bank)
 
 | `MOVX` address | Meaning |
 |----------------|---------|
@@ -392,7 +462,7 @@ USART's RS0/RS1.
 
 ---
 
-## 10. What the corrected dump changed vs. the previous one
+## 11. What the corrected dump changed vs. the previous one
 
 Compared to the earlier (corrupted) read, the new dump:
 
@@ -413,7 +483,7 @@ Compared to the earlier (corrupted) read, the new dump:
 
 ---
 
-## 11. Character generator and the bracket / umlaut hardware remap
+## 12. Character generator and the bracket / umlaut hardware remap
 
 The 2 KiB chargen EPROM stores 256 cells of 8 bytes each (5×7 glyph in
 the first 5 column-bytes, 3 columns of inter-character spacing). Bit 7
@@ -469,7 +539,7 @@ and ASCII display you flip that pin, no firmware change.
 
 ---
 
-## 12. Recommendations for a replacement firmware
+## 13. Recommendations for a replacement firmware
 
 Now that we know the SCN2661 setup, we can simply reuse it (or change
 it) and write to the same external addresses for display memory:
@@ -498,7 +568,7 @@ the original `STX <bcdpos> <char> ETX` framing.
 
 ---
 
-## 13. Open verification items
+## 14. Open verification items
 
 1. **Scope the SCN2661's RxC pin.** With 16× oversampling at 9600 baud
    it should be exactly 153.6 kHz. If you instead see 9600 Hz the chip
@@ -520,7 +590,7 @@ the original `STX <bcdpos> <char> ETX` framing.
 
 ---
 
-## 14. Deliverables produced during this analysis
+## 15. Deliverables produced during this analysis
 
 * `dis8048.py` — MCS-48 disassembler with flow-following trace.
 * `disasm48.txt`, `disasm48-v2.txt` — disassembly listings (the v2 file
