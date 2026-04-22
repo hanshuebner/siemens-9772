@@ -281,7 +281,7 @@ def demo_chargen(t: Terminal):
     t.clear_screen()
     time.sleep(0.2)
     # 40 cells per row; put 0x20..0x7A in blocks of 40 starting on row 0.
-    codes = list(range(0x20, 0x7B))
+    codes = list(range(0x20, 0x80))
     for start in range(0, len(codes), 40):
         row = start // 40
         chunk = bytes(codes[start:start + 40])
