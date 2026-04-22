@@ -1,5 +1,7 @@
 # Siemens 9772 Terminal — Firmware Analysis Report
 
+*** This analysis has been produced by Claude Code and is not accurate ***
+
 Subject: Reverse-engineering of `siemens-9772.hex` (2 KiB TMS2516 EPROM dump,
 re-read after the original dump was found to contain hundreds of bit errors).
 Goal: gather enough information about the terminal's hardware and firmware to
@@ -446,12 +448,41 @@ also XORs with `RAM[0x15]`:
 - `DC3 0xC8` — stop: the helper at `0x029B` zeroes `RAM[0x15]` and
   forces `P1.0 = 1`, `P1.1 = 0` (the initial post-self-test state).
 
-Exactly which of `P1.0` / `P1.1` is the global cursor-visible enable
-to the CRT, and which is a secondary attribute (reverse / alt-blink /
-bell LED), is not distinguishable from the firmware alone — the two
-commands are symmetric in the code. A quick "send `DC3 0xC6`, see what
-starts blinking; send `DC3 0xC7`, see what starts blinking" test on
-the live hardware settles it.
+Live-hardware experiments (`exercise.py --demo blink2` with the
+cursor parked at rows 0, 5, 11) settle what each bit drives:
+
+- **`P1.0` (BLINK A) — main video blink for rows 0..10.** When `P1.0`
+  toggles, the visible character-cell brightness on rows 0..10 toggles
+  along with it. **Row 11 is hardware-fixed as a "status row" and is
+  not affected by `P1.0`** regardless of where the cursor is — its
+  contents stay steady through BLINK A.
+- **`P1.1` (BLINK B) — combined cursor / status-row enable.** When
+  `P1.1` toggles, the cursor is suppressed (the bit-7 toggle on the
+  cursor cell still happens but its visible effect is gated by
+  `P1.1`) **and** row 11 is dropped from its always-on exemption, so
+  row 11 also blinks. The implication is that the status row and the
+  cursor share a single "overlay enable" line on the display PCB,
+  driven by `P1.1`.
+- The cursor's **rate** of blink is the timer-ISR tick rate; both
+  `P1.0` and `P1.1` toggle at the same rate when active, so BLINK A
+  and BLINK B look the same in terms of frequency.
+- The two `P1` bits are independent in firmware (`RAM[0x15]` is set
+  to either `0x01` or `0x02`, never `0x03`), so the combined effect
+  "row 11 blinks AND main rows blink AND cursor invisible" cannot be
+  produced by any single command — the firmware never emits both
+  toggles at once.
+
+Implications for re-implementing the firmware:
+
+- To match the original boot behaviour (steady screen, blinking
+  cursor on row 11), drive `P1.0 = 1` and `P1.1 = 0` permanently and
+  let the bit-7-of-cursor-cell toggle alone produce the cursor blink.
+- The hardware status-row distinction is between row 11 and the
+  rest; presumably in the 6-row and 2-row DIP modes the hardware
+  status row is still physical row 11 of the CRT raster (the
+  display-bank cap in `RAM[0x16]` only limits which banks the
+  firmware will *address*, not which scan lines the CRT renders).
+  This has not been verified against those DIP settings.
 
 ---
 
@@ -604,8 +635,7 @@ the original `STX <bcdpos> <char> ETX` framing.
 ## 15. Deliverables produced during this analysis
 
 * `dis8048.py` — MCS-48 disassembler with flow-following trace.
-* `disasm48.txt`, `disasm48-v2.txt` — disassembly listings (the v2 file
-  is from the corrected dump).
-* `siemens-9772.bin` — current binary derived from the latest hex dump.
+* `disasm48.txt` — disassembly listing
+* `siemens-9772.bin` — current binary derived from the hex dump.
 * `siemens-9772-chargen.{bin,hex}`, `render_chargen.py`,
   `siemens-9772-chargen.png` — character-generator EPROM and rendering.

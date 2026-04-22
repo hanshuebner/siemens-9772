@@ -5,6 +5,8 @@ for the Siemens 9772 — a small, dot-matrix CRT slave terminal from the
 early 1980s, designed for industrial / process-control multi-drop
 networks rather than for general-purpose host attachment.
 
+![Photo of the Siemens 9772 Terminal](./photo.jpg)
+
 The full technical analysis lives in
 [`siemens-9772-report.md`](siemens-9772-report.md). This README is the
 quick orientation.
@@ -38,12 +40,25 @@ out how that works.
 
 ## Hardware interface
 
-The upstream port is electrically **RS-422 / V.11 differential**,
+The male DE9 upstream port is electrically **RS-422 / V.11 differential**,
 following Siemens's *SS97* multi-drop convention. The connector carries
 the two differential pairs (TxD±, RxD±) and signal ground only — there
 are no modem-control handshake lines on the cable, and the firmware
 does not poll DSR / DCD / CTS. The receiver is enabled unconditionally
 by the SCN2661 init.
+
+### Serial port pinout
+
+| Pin | Function |
+|-----|----------|
+|  1  | TxD-     |
+|  3  | RxD-     |
+|  5  | GND      | 
+|  6  | TxD+     |
+|  8  | RxD+     |
+
+Remember that the lines need to be crossed when connecting to a RS422 host
+adapter, i.e. TxD- of the terminal goes to RxD- etc.
 
 ### Serial line settings
 
@@ -97,9 +112,12 @@ Two-state stream protocol, all bytes 7-bit ASCII:
 | `DC3 0xC3` | Status report: terminal transmits `0x12 0x80`. |
 | `DC3 0xC4` | Clear current row to `0x00`, cursor to column 0. |
 | `DC3 0xC5` | Clear current row to `0x20`, cursor to column 0. |
-| `DC3 0xC6` | Start cursor blink (P1.0). |
-| `DC3 0xC7` | Start alt-blink (P1.1). |
-| `DC3 0xC8` | Stop blinking. |
+| `DC3 0xC6` | BLINK A: toggle `P1.0` each timer tick. Drives the global video-blink for rows 0-10. **Row 11 is hardware-fixed as a status row and is exempt** — it stays steady. The cursor remains visible. |
+| `DC3 0xC7` | BLINK B: toggle `P1.1` each timer tick. Drives the combined cursor / status-row enable: while active, the cursor is suppressed and row 11 also blinks (i.e. it loses its exemption). |
+| `DC3 0xC8` | Stop blinking. Clears the toggle mask and forces `P1.0 = 1, P1.1 = 0` (the post-self-test idle state). |
+
+The two blink modes can't be combined — the firmware writes either
+`0x01` or `0x02` to the toggle mask, never `0x03`.
 
 ### Cursor positioning
 
@@ -195,8 +213,7 @@ swapped.
 | `siemens-9772-chargen.png` | Annotated render of all 256 chargen cells (4×4 PNG pixels per chargen pixel). |
 | `siemens-9772-chargen-plain.png` | Same render without overlay. |
 | `dis8048.py` | MCS-48 disassembler used for the analysis. |
-| `disasm48-v2.txt` | Disassembly of the corrected dump. |
-| `disasm48.txt` | Disassembly of the original (bad) dump, kept for diff. |
+| `disasm48.txt` | Disassembly of the firmware. |
 | `render_chargen.py` | Generates the chargen PNGs. |
 | `read-eprom.py` | TL866-side script that produced the dumps. |
 | `exercise.py` | Protocol exerciser / demo script. |

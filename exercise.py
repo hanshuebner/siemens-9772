@@ -334,17 +334,196 @@ def demo_positions(t: Terminal):
         time.sleep(0.05)
 
 
+def _fill_labelled_screen(t: Terminal):
+    """Fill all 12 rows with `row NN | <ramp>` so any per-row blink
+    behaviour is easy to spot."""
+    ramp_upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"
+    ramp_lower = "abcdefghijklmnopqrstuvwxyz0123"
+    for row in range(12):
+        ramp = ramp_upper if row % 2 == 0 else ramp_lower
+        t.write_text(row, 0, f"row {row:02d} | {ramp}"[:40])
+
+
+def _wait_enter(msg: str = ""):
+    try:
+        input(f"           [Enter] {msg}".rstrip())
+    except EOFError:
+        print()
+
+
 def demo_blink(t: Terminal):
-    """Enter blink mode A for 3s, mode B for 3s, then stop."""
+    """Investigate what BLINK A (DC3 0xC6) and BLINK B (DC3 0xC7)
+    actually affect.
+
+    Background: the timer/counter ISR XORs P1 with RAM[0x15] on every
+    tick. blink_a sets RAM[0x15] = 0x01 (toggles P1.0), blink_b sets
+    RAM[0x15] = 0x02 (toggles P1.1), blink_off clears it. Where P1.0
+    and P1.1 go on the display PCB is hardware - typical guesses are
+    global video enable, global reverse-video, global underline enable
+    or cursor enable. The cursor's own per-cell blink is independent
+    (the ISR also unconditionally XORs bit 7 of the cursor cell).
+
+    This demo fills every row with a recognisable pattern, parks the
+    cursor in a known spot, and runs each blink mode in isolation with
+    a 'quiet' baseline before and between them so you can compare:
+
+        - does the whole screen blink, or just some cells?
+        - does the cursor cell behave differently from the rest?
+        - is the underline affected (it normally is hardware-always-on)?
+        - is the toggle rate different between A and B?
+        - is one mode reverse-video and the other on/off?
+
+    Watch the screen as the script narrates each phase. The final
+    'rapid AB toggle' block flips between the two modes every 1 s so
+    you can A/B them side by side."""
+    print("Filling all 12 rows with a labelled pattern...")
     t.clear_screen()
-    t.write_text(0, 0, "BLINK A (P1.0 toggle)")
-    t.blink_a()
-    time.sleep(3.0)
-    t.write_text(1, 0, "BLINK B (P1.1 toggle)")
-    t.blink_b()
-    time.sleep(3.0)
+    time.sleep(0.3)
+    _fill_labelled_screen(t)
+    # Park cursor at a non-distracting corner so its own blink doesn't
+    # confuse the global-blink question. Pick the bottom-right cell
+    # (row 11, col 39) - it sits on a digit so it's easy to see.
+    t.goto(11, 39)
+
+    def wait():
+        _wait_enter("press Enter for the next phase")
+
+    print()
+    print("Phase 1/5: BASELINE (no blink). The only thing that should be")
+    print("           moving is the cursor at (11, 39).")
     t.blink_off()
-    t.write_text(2, 0, "blink off")
+    wait()
+
+    print()
+    print("Phase 2/5: BLINK A on (DC3 0xC6, RAM[0x15] = 0x01 -> P1.0 toggles).")
+    print("           Watch: whole screen? cursor only? underline?")
+    print("           reverse-video? what's the toggle period?")
+    t.blink_a()
+    wait()
+    t.blink_off()
+
+    print()
+    print("Phase 3/5: BASELINE again (sanity - screen should be still).")
+    wait()
+
+    print()
+    print("Phase 4/5: BLINK B on (DC3 0xC7, RAM[0x15] = 0x02 -> P1.1 toggles).")
+    print("           Same questions as Phase 2 - is it the same effect as A,")
+    print("           a different effect, or no effect?")
+    t.blink_b()
+    wait()
+    t.blink_off()
+
+    print()
+    print("Phase 5/5: Rapid A/B toggle every 1 s. If A and B do different")
+    print("           things you should see two distinguishable states; if")
+    print("           they're the same, it'll look like one steady blink.")
+    print("           Press Enter to start, then Enter again to stop.")
+    try:
+        input()
+    except EOFError:
+        print()
+    stop = [False]
+    import threading
+    def stopper():
+        try:
+            input()
+        except EOFError:
+            pass
+        stop[0] = True
+    th = threading.Thread(target=stopper, daemon=True)
+    th.start()
+    while not stop[0]:
+        t.blink_a()
+        for _ in range(10):
+            if stop[0]:
+                break
+            time.sleep(0.1)
+        if stop[0]:
+            break
+        t.blink_b()
+        for _ in range(10):
+            if stop[0]:
+                break
+            time.sleep(0.1)
+    t.blink_off()
+
+    print()
+    print("Done. Blink off. Screen should be still again (except cursor).")
+
+
+def demo_blink2(t: Terminal):
+    """Follow-up to demo_blink. Tests whether the 'steady row' under
+    BLINK A really follows the cursor (which would mean the cursor's
+    row is hardware-exempt from the global blink), or whether row 11
+    is just a hardware-special status row that's always exempt.
+
+    Recipe: park the cursor at row 0, then row 5, then row 11. For
+    each position run BLINK A and BLINK B and watch.
+
+    Hypothesis being tested:
+      - P1.0 (BLINK A) drives the global video-blink, with the row
+        containing the cursor cell exempted (cursor remains visible).
+      - P1.1 (BLINK B) drives cursor enable; toggling it suppresses
+        the cursor and removes the row exemption (so the cursor row
+        also blinks).
+
+    What you should see if the hypothesis is correct:
+      - Cursor at row 0:  BLINK A leaves row 0 steady, rows 1-11 blink.
+      - Cursor at row 5:  BLINK A leaves row 5 steady, others blink.
+      - Cursor at row 11: BLINK A leaves row 11 steady (= demo_blink).
+      - Under BLINK B: every row blinks, cursor is invisible at
+        whichever position you parked it.
+
+    What it might mean if the hypothesis is wrong:
+      - If row 11 always stays steady regardless of cursor position,
+        row 11 is a hardware status row and the cursor exemption is
+        not the right model.
+      - If the cursor stays visible under BLINK B, P1.1 is something
+        other than cursor enable.
+    """
+    print("Filling screen with the labelled pattern (same as demo_blink)...")
+    t.clear_screen()
+    time.sleep(0.3)
+    _fill_labelled_screen(t)
+
+    step = [0]
+    def step_label(action: str, predict: str) -> str:
+        step[0] += 1
+        return f"step {step[0]:2d}: {action}  (PREDICT: {predict})"
+
+    for cur_row in (0, 5, 11):
+        print()
+        print(f"=== Cursor at row {cur_row}, col 20 ===")
+        t.blink_off()
+        t.goto(cur_row, 20)
+        _wait_enter(step_label(
+            f"baseline, cursor at ({cur_row}, 20)",
+            f"only the cursor at ({cur_row}, 20) blinks"))
+
+        t.blink_a()
+        _wait_enter(step_label(
+            f"BLINK A on, cursor at ({cur_row}, 20)",
+            f"row {cur_row} steady, others blink, cursor visible"))
+        t.blink_off()
+
+        # Re-park the cursor in case any hardware quirk moved/lost it.
+        t.goto(cur_row, 20)
+        _wait_enter(step_label(
+            f"baseline again, cursor at ({cur_row}, 20)",
+            "screen still, only the cursor blinks"))
+
+        t.blink_b()
+        _wait_enter(step_label(
+            f"BLINK B on, cursor at ({cur_row}, 20)",
+            f"every row blinks (incl. row {cur_row}), cursor invisible"))
+        t.blink_off()
+
+    print()
+    print("Done. Interpretation:")
+    print(" - 'Steady row' followed cursor: confirmed P1.0 = main blink with cursor-row exempt.")
+    print(" - Row 11 always steady regardless of cursor: row 11 is a HW status row, not a cursor exemption.")
+    print(" - Cursor invisible under BLINK B at every position: confirmed P1.1 = cursor enable.")
 
 
 def demo_ping(t: Terminal):
@@ -424,7 +603,8 @@ def demo_classic(t: Terminal):
 
 
 def demo_cycle(t: Terminal):
-    """Run every demo with pauses."""
+    """Run every non-interactive demo with pauses. Skips blink / blink2
+    because those need you to press Enter."""
     for name, fn in [
         ("banner", demo_banner),
         ("classic", demo_classic),
@@ -432,7 +612,6 @@ def demo_cycle(t: Terminal):
         ("positions", demo_positions),
         ("umlaut", demo_umlaut),
         ("single", demo_single),
-        ("blink", demo_blink),
         ("ping", demo_ping),
         ("status", demo_status),
     ]:
@@ -450,6 +629,7 @@ DEMOS = {
     "umlaut": demo_umlaut,
     "positions": demo_positions,
     "blink": demo_blink,
+    "blink2": demo_blink2,
     "ping": demo_ping,
     "status": demo_status,
     "single": demo_single,
