@@ -21,12 +21,13 @@ controller. The firmware:
 - runs a power-on ROM checksum, internal-RAM walking-bit test, external-RAM
   test (across 16 P2-selected memory banks), and a SCN2661 internal
   loopback test;
-- programs the SCN2661 to **9600 baud, async 16× oversampling, 8 data
+- programs the SCN2661 to **19200 baud, async 16× oversampling, 8 data
   bits, odd parity, 1 stop bit** (1 start + 8 data + 1 parity + 1 stop =
   11 bit times per character) using the chip's internal baud-rate
-  generator. With the 5.0688 MHz system crystal the math is exact: the
-  BRG produces 153.6 kHz (= 5.0688 MHz / 33), and 153.6 kHz / 16 = 9600
-  baud;
+  generator. With the 5.0688 MHz system crystal the BRG synthesises
+  19200 by alternating /16 and /17 dividers (5.0688 MHz / 16.5 / 16 =
+  19200 exactly on average); confirmed against scope measurements of
+  ~50 µs/bit on TxD;
 - reads two DIP-switch bits on P1.4 and P1.5 to choose one of three
   display-size / multi-node modes;
 - runs a small protocol state machine that recognises STX, ETX, DC1, DC3
@@ -124,24 +125,32 @@ hardware address-remap on the display board (see §11).
 
 | Bits | Field | Value | Meaning |
 |------|-------|-------|---------|
-| D3:D0 | BRG baud-rate code | `1110` (=14) | **9600 baud** in the standard SCN2661 BRG table |
+| D3:D0 | BRG baud-rate code | `1110` (=14) | **19200 baud** in the SCN2661B BRG table |
 | D4 | Tx clock select | `1` | from internal BRG |
 | D5 | Rx clock select | `1` | from internal BRG |
 | D7:D6 | reserved | `00` | — |
 
-So the chip runs its **internal BRG at 9600 baud** and uses that clock
+So the chip runs its **internal BRG at 19200 baud** and uses that clock
 both for transmit and for receive. With 16× oversampling the BRG drives
-RxC/TxC at 9600 × 16 = **153.6 kHz**. With the 5.0688 MHz system crystal
-this lands exactly on the integer divider: 5.0688 MHz / 33 = 153.6 kHz
-to the part-per-million. The Signetics SCN2661B variant ships with a
-BRG table calibrated to 5.0688 MHz, so this is the chip variant the
-board is using (or the board has a separate 4.9152 MHz crystal on the
-SCN2661, which would also give exactly 9600 baud via the standard
-SCN2661A table).
+RxC/TxC at 19200 × 16 = **307.2 kHz** nominal. With the 5.0688 MHz system
+crystal the divider needed is 5.0688 MHz / 307.2 kHz = 16.5 — not an
+integer, so the SCN2661B BRG synthesises it by alternating between /16
+and /17. The instantaneous TxC/RxC half-period therefore jitters by ~6%
+between two values; the average is exact and the receiver's 16×
+oversampling absorbs the jitter trivially.
 
-Easiest verification: scope the **TxC** or **RxC** pin of the SCN2661.
-You should see exactly 153.6 kHz — anything else means the BRG input
-clock isn't what the standard table assumes.
+Easiest verification: **scope TxD on the SCN2661 and measure the bit
+width** — at 19200 baud one bit is 52 µs (a "~50 µs" reading on a
+typical scope). The TxC/RxC pins should average 307.2 kHz but will show
+two alternating half-cycle widths (≈3.16 µs and ≈3.36 µs) due to the
+fractional divider; that two-valued waveform is normal and is the
+fingerprint of a 19200-from-5.0688-MHz BRG configuration.
+
+**Earlier versions of this report claimed 9600 baud** based on a wrong
+mapping of code 14 against the older 2651 baud table. The 2661B table
+doubles the rates in the upper half (code 12 = 7200, code 13 = 9600,
+code 14 = 19200, code 15 = 38400). Bit-width measurement on the actual
+hardware put it beyond doubt: this terminal is **19200 8O1**.
 
 ### CR after self-test: 0x15 = `0001_0101`
 
@@ -548,9 +557,9 @@ it) and write to the same external addresses for display memory:
 ; --- one-shot UART init for replacement firmware ---
 MOV  R0,#88h       ; MR address
 MOV  A,#5Eh
-MOVX @R0,A         ; MR1: async 1x, 6 bits, odd parity, 2 stop
+MOVX @R0,A         ; MR1: async 16x, 8 bits, odd parity, 1 stop
 MOV  A,#3Eh
-MOVX @R0,A         ; MR2: BRG @ 9600, both clocks from BRG
+MOVX @R0,A         ; MR2: BRG @ 19200, both clocks from BRG
 
 MOV  R0,#8Ch       ; CR address
 MOV  A,#15h
@@ -570,10 +579,12 @@ the original `STX <bcdpos> <char> ETX` framing.
 
 ## 14. Open verification items
 
-1. **Scope the SCN2661's RxC pin.** With 16× oversampling at 9600 baud
-   it should be exactly 153.6 kHz. If you instead see 9600 Hz the chip
-   is in 1× mode and our MR1 decode is wrong; if you see another
-   frequency the BRG input clock isn't what the standard table assumes.
+1. **Scope the SCN2661's TxD pin** (better target than RxC, since RxC is
+   a two-valued waveform from the fractional /16-and-/17 BRG and a
+   simple frequency reading averages it). One bit time should be 52 µs;
+   "around 50 µs" on a typical scope confirms 19200 baud. RxC/TxC will
+   average 307.2 kHz with ~6% cycle-to-cycle jitter — that jitter is the
+   signature of the fractional divider and is normal.
 2. **Identify the T0 source on the PCB.** It should be wired to the
    SCN2661's TxRDY (or its complement). The DC4 handler busy-waits on
    T0 before each transmit byte.

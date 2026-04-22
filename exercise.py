@@ -2,7 +2,7 @@
 """Exercise the Siemens 9772 terminal over its upstream serial port.
 
 Line format (set by the factory firmware):
-    9600 baud, 8 data bits, odd parity, 1 stop bit (8O1)
+    19200 baud, 8 data bits, odd parity, 1 stop bit (8O1)
 
 Protocol summary (extracted from firmware disassembly):
 
@@ -123,7 +123,7 @@ def row_byte(row: int) -> int:
 # --- Serial helpers ------------------------------------------------------
 
 class Terminal:
-    def __init__(self, port: str, baud: int = 9600):
+    def __init__(self, port: str, baud: int = 19200):
         # Some UARTs accept PARITY_ODD directly. 8O1 frame: 8 data + parity + 1 stop.
         self.ser = serial.Serial(
             port=port,
@@ -233,11 +233,12 @@ class Terminal:
         self.send(DC4, payload)
         return self.read(2, timeout=timeout)
 
-    def read_power_on_hello(self, timeout: float = 3.0) -> bytes:
-        """After a reset the firmware transmits 0x12 0x90 as a power-on
-        greeting. Call this immediately after opening the port / resetting
-        the terminal to confirm serial RX (host <- terminal) works."""
-        return self.read(2, timeout=timeout)
+    def read_power_on_hello(self) -> bytes:
+        """Block until the terminal's power-on greeting (0x12 0x90)
+        arrives, then return it. The firmware emits this pair of bytes
+        on every reset, so reset the terminal after calling this."""
+        self.ser.timeout = None
+        return self.ser.read(2)
 
 
 # --- Demos ---------------------------------------------------------------
@@ -374,10 +375,59 @@ def demo_single(t: Terminal):
         time.sleep(0.08)
 
 
+_CLASSIC_GLYPHS = {
+    'A': [' # ', '# #', '###', '# #', '# #'],
+    'C': ['###', '#  ', '#  ', '#  ', '###'],
+    'G': ['###', '#  ', '# #', '# #', '###'],
+    'I': ['###', ' # ', ' # ', ' # ', '###'],
+    'L': ['#  ', '#  ', '#  ', '#  ', '###'],
+    'M': ['# #', '###', '# #', '# #', '# #'],
+    'N': ['# #', '###', '###', '# #', '# #'],
+    'O': ['###', '# #', '# #', '# #', '###'],
+    'P': ['###', '# #', '###', '#  ', '#  '],
+    'S': ['###', '#  ', '###', '  #', '###'],
+    'T': ['###', ' # ', ' # ', ' # ', ' # '],
+    'U': ['# #', '# #', '# #', '# #', '###'],
+}
+
+
+def _render_block_word(word: str, screen_cols: int = 40) -> list[str]:
+    """Render WORD as a 5-row, 3-column-per-letter block-font banner,
+    centered in SCREEN_COLS columns. Letters are separated by one space."""
+    rows = ['' for _ in range(5)]
+    for i, ch in enumerate(word):
+        glyph = _CLASSIC_GLYPHS[ch]
+        for r in range(5):
+            if i:
+                rows[r] += ' '
+            rows[r] += glyph[r]
+    pad = max(0, (screen_cols - len(rows[0])) // 2)
+    return [(' ' * pad) + row for row in rows]
+
+
+def demo_classic(t: Terminal):
+    """Render a 'CLASSIC COMPUTING' ASCII-art banner using a 3x5 block
+    font. Designed for the 12-row (480-cell) display mode: rows 0-4 show
+    'CLASSIC', rows 6-10 show 'COMPUTING'. In 6-row mode only the
+    'CLASSIC' line and the top of 'COMPUTING' will be visible; in 2-row
+    mode you'll only see the top stripe."""
+    classic = _render_block_word('CLASSIC')        # 27 cols + 6 pad = 33
+    computing = _render_block_word('COMPUTING')    # 35 cols + 2 pad = 37
+
+    t.clear_screen()
+    time.sleep(0.3)
+
+    for r, line in enumerate(classic):
+        t.write_text(r, 0, line)
+    for r, line in enumerate(computing):
+        t.write_text(6 + r, 0, line)
+
+
 def demo_cycle(t: Terminal):
     """Run every demo with pauses."""
     for name, fn in [
         ("banner", demo_banner),
+        ("classic", demo_classic),
         ("chargen", demo_chargen),
         ("positions", demo_positions),
         ("umlaut", demo_umlaut),
@@ -395,6 +445,7 @@ DEMOS = {
     "clear": demo_clear,
     "bringup": demo_bringup,
     "banner": demo_banner,
+    "classic": demo_classic,
     "chargen": demo_chargen,
     "umlaut": demo_umlaut,
     "positions": demo_positions,
@@ -409,27 +460,25 @@ DEMOS = {
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("port", help="Serial port, e.g. /dev/ttyUSB0 or COM3")
-    ap.add_argument("--baud", type=int, default=9600)
+    ap.add_argument("--baud", type=int, default=19200)
     ap.add_argument("--demo", default="cycle",
                     choices=sorted(DEMOS), help="which demo to run")
     ap.add_argument("--listen-hello", action="store_true",
-                    help="Instead of a demo, wait up to 3 s for the "
+                    help="Instead of a demo, block waiting for the "
                          "terminal's power-on greeting (0x12 0x90) and "
-                         "print it. Reset the terminal before running.")
+                         "print it. Reset the terminal after launching.")
     args = ap.parse_args()
 
     t = Terminal(args.port, baud=args.baud)
     try:
         if args.listen_hello:
+            print("Waiting for power-on greeting (reset the terminal now; Ctrl-C to abort)...")
             reply = t.read_power_on_hello()
-            if reply:
-                print(f"received: {reply.hex(' ')}")
-                if reply == b"\x12\x90":
-                    print("  -> matches the expected power-on 0x12 0x90 greeting")
-                else:
-                    print("  -> does NOT match 0x12 0x90 - check baud/parity/reset")
+            print(f"received: {reply.hex(' ')}")
+            if reply == b"\x12\x90":
+                print("  -> matches the expected power-on 0x12 0x90 greeting")
             else:
-                print("no bytes within 3 s - check wiring / reset the terminal")
+                print("  -> does NOT match 0x12 0x90 - check baud/parity/reset")
         else:
             DEMOS[args.demo](t)
     finally:
